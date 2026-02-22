@@ -18,6 +18,37 @@ function docLink(name: string): string {
   return `reify:doc/${fsKitImport}#${name}`;
 }
 
+function splitLinesWithEndings(text: string): string[] {
+  if (text.length === 0) return [];
+
+  const lines: string[] = [];
+  let start = 0;
+  let i = 0;
+
+  while (i < text.length) {
+    const ch = text.charCodeAt(i);
+    if (ch !== 10 && ch !== 13) {
+      i += 1;
+      continue;
+    }
+
+    if (ch === 13 && i + 1 < text.length && text.charCodeAt(i + 1) === 10) {
+      i += 2;
+    } else {
+      i += 1;
+    }
+
+    lines.push(text.slice(start, i));
+    start = i;
+  }
+
+  if (start < text.length) {
+    lines.push(text.slice(start));
+  }
+
+  return lines;
+}
+
 export const readText = defineTool({
   kit: fsKitName,
   name: "readText",
@@ -36,6 +67,72 @@ export const readText = defineTool({
   ].join("\n"),
   fn: async ({ path }) => {
     return await readFile(path, "utf8");
+  },
+});
+
+export const readTextWindow = defineTool({
+  kit: fsKitName,
+  name: "readTextWindow",
+  summary: "Read a line window from a UTF-8 text file",
+  input: schema({
+    path: schema("string").describe("File path to read"),
+    startLine: schema("number").describe("1-based starting line").default(1),
+    maxLines: schema("number").describe("Maximum number of lines (1-1000)").default(200),
+  }),
+  output: schema({
+    text: "string",
+    startLine: "number",
+    endLine: "number | null",
+    nextStartLine: "number | null",
+  }),
+  doc: [
+    "Read a contiguous line window from a UTF-8 file.",
+    "",
+    "- Line indexing is 1-based.",
+    "- Defaults: `startLine = 1` and `maxLines = 200`.",
+    "- `maxLines` must be an integer between 1 and 1000.",
+    "- Line endings are preserved exactly (`\\n` and `\\r\\n`).",
+    "- If `startLine` is past EOF, returns `text: \"\"`, `endLine: null`, `nextStartLine: null`.",
+    "- `nextStartLine: null` means there are no more lines to read.",
+    "",
+    "Example:",
+    "```ts",
+    'const out = await readTextWindow({ path: "README.md", startLine: 1, maxLines: 50 });',
+    "```",
+  ].join("\n"),
+  fn: async ({ path, startLine, maxLines }) => {
+    if (!Number.isInteger(startLine) || startLine < 1) {
+      throw new TypeError("startLine must be an integer >= 1");
+    }
+
+    if (!Number.isInteger(maxLines) || maxLines < 1) {
+      throw new TypeError("maxLines must be an integer >= 1");
+    }
+
+    if (maxLines > 1000) {
+      throw new TypeError("maxLines must be <= 1000");
+    }
+
+    const sourceText = await readFile(path, "utf8");
+    const lines = splitLinesWithEndings(sourceText);
+
+    if (startLine > lines.length) {
+      return {
+        text: "",
+        startLine,
+        endLine: null,
+        nextStartLine: null,
+      };
+    }
+
+    const window = lines.slice(startLine - 1, startLine - 1 + maxLines);
+    const endLine = startLine + window.length - 1;
+    return {
+      text: window.join(""),
+      startLine,
+      endLine,
+      nextStartLine: endLine < lines.length ? endLine + 1 : null,
+    };
   },
 });
 
@@ -121,6 +218,7 @@ export const fsKit: Kit = defineKit({
         "",
         "Tools:",
         `- \`${toolLink("readText")}\``,
+        `- \`${toolLink("readTextWindow")}\``,
         `- \`${toolLink("writeText")}\``,
         `- \`${toolLink("listDir")}\``,
         "",
@@ -159,6 +257,7 @@ export const fsKit: Kit = defineKit({
   },
   tools: {
     readText,
+    readTextWindow,
     writeText,
     listDir,
   },

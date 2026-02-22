@@ -9,6 +9,7 @@ describe("kit-scoped listing helpers", () => {
     expect(listTools(fsKit)).toEqual([
       { name: "listDir", summary: "List directory entries (optionally recursive)" },
       { name: "readText", summary: "Read a file as UTF-8 text" },
+      { name: "readTextWindow", summary: "Read a line window from a UTF-8 text file" },
       { name: "writeText", summary: "Write UTF-8 text to a file" },
     ]);
   });
