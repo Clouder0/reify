@@ -10,6 +10,8 @@ describe("kit-scoped listing helpers", () => {
       { name: "listDir", summary: "List directory entries (optionally recursive)" },
       { name: "readText", summary: "Read a file as UTF-8 text" },
       { name: "readTextWindow", summary: "Read a line window from a UTF-8 text file" },
+      { name: "scanTree", summary: "Scan a directory into a bounded, deterministic nodes map" },
+      { name: "viewTree", summary: "Render a scanTree() result as a compact indented tree" },
       { name: "writeText", summary: "Write UTF-8 text to a file" },
     ]);
   });

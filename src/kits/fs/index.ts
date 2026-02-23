@@ -1,6 +1,7 @@
 import { type as schema } from "arktype";
-import { readFile, readdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import type { Dirent } from "node:fs";
+import { readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
+import { basename, join } from "node:path";
 
 import { defineTool } from "../../defineTool.js";
 import { defineKit } from "../../defineKit.js";
@@ -48,6 +49,59 @@ function splitLinesWithEndings(text: string): string[] {
 
   return lines;
 }
+
+export type DirListing = {
+  /** Directory basenames (sorted). */
+  dirs?: string[];
+
+  /** File basenames (sorted). */
+  files?: string[];
+
+  /**
+   * Local incompleteness marker.
+   * - `true`: omitted children exist but count is unknown (depth/global early-stop).
+   * - `number`: omitted direct-children count (known).
+   */
+  more?: true | number;
+
+  /** Unreadable directory marker (errno code preferred). */
+  error?: string;
+};
+
+export type ScanTreeOutput = {
+  /** Resolved absolute root path. */
+  root: string;
+
+  /** Root-relative POSIX directory path -> listing (root key is "."). */
+  nodes: Record<string, DirListing>;
+};
+
+export type ScanTreeInput = {
+  /** Root directory to scan. */
+  path: string;
+
+  /** Maximum expansion depth (root is 0). */
+  maxDepth?: number;
+
+  /** Global budget for emitted entries (dirs + files). */
+  maxEntries?: number;
+
+  /** Per-directory budget for emitted direct children. */
+  maxEntriesPerDir?: number;
+
+  /** Directory basenames to exclude anywhere in the tree. */
+  excludeDirs?: string[];
+};
+
+const DirListingSchema = schema({
+  "dirs?": "string[]",
+  "files?": "string[]",
+  "more?": "true | number",
+  "error?": "string",
+});
+
+const NodesSchema = schema({ "[string]": DirListingSchema });
+const ScanTreeOutputSchema = schema({ root: "string", nodes: NodesSchema });
 
 export const readText = defineTool({
   kit: fsKitName,
@@ -205,6 +259,238 @@ export const listDir = defineTool({
   },
 });
 
+function normalizeIntGE0(name: string, value: number, fallback: number): number {
+  const n = Number.isFinite(value) ? Math.floor(value) : fallback;
+  if (!Number.isInteger(n) || n < 0) {
+    throw new TypeError(`${name} must be an integer >= 0`);
+  }
+
+  return n;
+}
+
+function joinRelPosix(parent: string, name: string): string {
+  return parent === "." ? name : `${parent}/${name}`;
+}
+
+function fsPathForRel(root: string, rel: string): string {
+  if (rel === ".") return root;
+  return join(root, ...rel.split("/"));
+}
+
+function errCode(err: unknown): string {
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  if (typeof code === "string" && code.length > 0) return code;
+  return err instanceof Error ? err.name : "Error";
+}
+
+export const scanTree = defineTool({
+  kit: fsKitName,
+  name: "scanTree",
+  summary: "Scan a directory into a bounded, deterministic nodes map",
+  input: schema({
+    path: schema("string").describe("Root directory to scan"),
+    maxDepth: schema("number").describe("Maximum scan depth (0+)").default(6),
+    maxEntries: schema("number").describe("Global entry budget (0+)").default(500),
+    maxEntriesPerDir: schema("number").describe("Per-directory entry budget (0+)").default(50),
+    excludeDirs: schema("string[]")
+      .describe("Directory basenames to exclude")
+      .default(() => [".git", "node_modules"]),
+  }),
+  output: ScanTreeOutputSchema,
+  doc: [
+    "Scan a directory tree into a bounded, deterministic map for progressive disclosure.",
+    "",
+    "Output shape:",
+    "- `nodes` is a map keyed by root-relative POSIX paths (root key is `\".\"`).",
+    "- Each `DirListing` contains sorted `dirs` and `files` basenames.",
+    "- `more: true` means the directory exists but wasn't expanded (depth/budget).",
+    "- `more: N` means `N` direct children were omitted (per-dir/global clipping).",
+    "- Symlinks are skipped.",
+    "",
+    "Example:",
+    "```ts",
+    'import { scanTree, viewTree } from "@reify-ai/reify/kits/fs";',
+    'const scan = await scanTree({ path: ".", maxEntries: 300 });',
+    "console.log(await viewTree(scan));",
+    "```",
+  ].join("\n"),
+  fn: async ({
+    path,
+    maxDepth,
+    maxEntries,
+    maxEntriesPerDir,
+    excludeDirs,
+  }: ScanTreeInput): Promise<ScanTreeOutput> => {
+    const depthLimit = normalizeIntGE0("maxDepth", maxDepth ?? 6, 6);
+    let remaining = normalizeIntGE0("maxEntries", maxEntries ?? 500, 500);
+    const perDir = normalizeIntGE0("maxEntriesPerDir", maxEntriesPerDir ?? 50, 50);
+    const exclude = new Set(excludeDirs ?? [".git", "node_modules"]);
+
+    const root = await realpath(path);
+    const st = await stat(root);
+    if (!st.isDirectory()) {
+      throw new TypeError("scanTree path must be an existing directory");
+    }
+
+    const nodes: Record<string, DirListing> = { ".": {} };
+    const queue: Array<{ rel: string; depth: number }> = [{ rel: ".", depth: 0 }];
+    const visited = new Set<string>();
+
+    for (let i = 0; i < queue.length; i += 1) {
+      const { rel, depth } = queue[i];
+      if (visited.has(rel)) continue;
+      visited.add(rel);
+
+      let listing = nodes[rel];
+      if (!listing) {
+        listing = {};
+        nodes[rel] = listing;
+      }
+      if (listing.error) continue;
+
+      if (depth >= depthLimit) {
+        listing.more ??= true;
+        continue;
+      }
+
+      if (remaining <= 0) {
+        listing.more ??= true;
+        continue;
+      }
+
+      const full = fsPathForRel(root, rel);
+      let entries: Dirent[];
+      try {
+        entries = await readdir(full, { withFileTypes: true });
+      } catch (err) {
+        listing.error = errCode(err);
+        continue;
+      }
+
+      const dirs: string[] = [];
+      const files: string[] = [];
+
+      for (const entry of entries) {
+        if (entry.isSymbolicLink()) continue;
+
+        if (entry.isDirectory()) {
+          if (exclude.has(entry.name)) continue;
+          dirs.push(entry.name);
+        } else {
+          files.push(entry.name);
+        }
+      }
+
+      dirs.sort();
+      files.sort();
+
+      const total = dirs.length + files.length;
+      const includeLimit = Math.min(perDir, remaining);
+      const includeDirs = dirs.slice(0, Math.min(dirs.length, includeLimit));
+      const leftover = includeLimit - includeDirs.length;
+      const includeFiles =
+        leftover > 0 ? files.slice(0, Math.min(files.length, leftover)) : [];
+
+      const included = includeDirs.length + includeFiles.length;
+      remaining -= included;
+
+      if (includeDirs.length > 0) listing.dirs = includeDirs;
+      if (includeFiles.length > 0) listing.files = includeFiles;
+      if (total > included) listing.more = total - included;
+
+      for (const name of includeDirs) {
+        const childRel = joinRelPosix(rel, name);
+        let child = nodes[childRel];
+        if (!child) {
+          child = {};
+          nodes[childRel] = child;
+        }
+
+        if (depth + 1 >= depthLimit) {
+          child.more ??= true;
+          continue;
+        }
+
+        queue.push({ rel: childRel, depth: depth + 1 });
+      }
+    }
+
+    return { root, nodes };
+  },
+});
+
+function escapeTreeName(name: string): string {
+  // Preserve one-item-per-line rendering.
+  return name.replace(/\r/g, "\\r").replace(/\n/g, "\\n").replace(/\t/g, "\\t");
+}
+
+function dirSuffix(listing: DirListing | undefined): string {
+  if (!listing) return "/...";
+  if (listing.error) return `/! (${listing.error})`;
+  if (listing.more !== undefined) {
+    return listing.more === true ? "/..." : `/... (+${listing.more})`;
+  }
+
+  return "/";
+}
+
+export const viewTree = defineTool({
+  kit: fsKitName,
+  name: "viewTree",
+  summary: "Render a scanTree() result as a compact indented tree",
+  input: ScanTreeOutputSchema,
+  output: schema("string"),
+  doc: [
+    "Render a `scanTree()` result into a token-efficient tree string.",
+    "",
+    "- Fixed format: 2-space indentation, directories first, then files.",
+    "- `name/...` means the directory is incomplete or unexpanded.",
+    "- `name/... (+N)` includes the omitted direct children count when known.",
+    "- `name/! (EACCES)` indicates an unreadable directory.",
+    "",
+    "Example:",
+    "```ts",
+    'import { scanTree, viewTree } from "@reify-ai/reify/kits/fs";',
+    'const scan = await scanTree({ path: "." });',
+    "console.log(await viewTree(scan));",
+    "```",
+  ].join("\n"),
+  fn: (scan: ScanTreeOutput) => {
+    const nodes = scan.nodes;
+    const rootListing = nodes["."];
+    const rootLabel = basename(scan.root) || scan.root;
+    const lines: string[] = [`${escapeTreeName(rootLabel)}${dirSuffix(rootListing)}`];
+    const visited = new Set<string>();
+
+    function renderDir(rel: string, depth: number): void {
+      if (visited.has(rel)) return;
+      visited.add(rel);
+
+      const listing = nodes[rel];
+      if (!listing || listing.error) return;
+
+      const indent = "  ".repeat(depth);
+
+      const dirs = (listing.dirs ?? []).slice().sort();
+      const files = (listing.files ?? []).slice().sort();
+
+      for (const name of dirs) {
+        const childRel = rel === "." ? name : `${rel}/${name}`;
+        const child = nodes[childRel];
+        lines.push(`${indent}${escapeTreeName(name)}${dirSuffix(child)}`);
+        renderDir(childRel, depth + 1);
+      }
+
+      for (const name of files) {
+        lines.push(`${indent}${escapeTreeName(name)}`);
+      }
+    }
+
+    renderDir(".", 1);
+    return lines.join("\n");
+  },
+});
+
 export const fsKit: Kit = defineKit({
   name: fsKitName,
   summary: fsKitSummary,
@@ -221,6 +507,8 @@ export const fsKit: Kit = defineKit({
         `- \`${toolLink("readTextWindow")}\``,
         `- \`${toolLink("writeText")}\``,
         `- \`${toolLink("listDir")}\``,
+        `- \`${toolLink("scanTree")}\``,
+        `- \`${toolLink("viewTree")}\``,
         "",
         "Docs:",
         `- \`${docLink("recipes/read-write")}\``,
@@ -260,6 +548,8 @@ export const fsKit: Kit = defineKit({
     readTextWindow,
     writeText,
     listDir,
+    scanTree,
+    viewTree,
   },
 });
 
