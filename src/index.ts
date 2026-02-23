@@ -6,3 +6,5 @@ export type { InspectedTool } from "./inspectTool.js";
 export { listTools } from "./listTools.js";
 export { listDocs } from "./listDocs.js";
 export { listKits } from "./listKits.js";
+export { formatValue } from "./formatValue.js";
+export type { FormatValueOptions } from "./formatValue.js";

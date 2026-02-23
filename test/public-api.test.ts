@@ -9,6 +9,7 @@ test("public API is kit-major", () => {
   expect(typeof reify.inspectTool).toBe("function");
   expect(typeof reify.listTools).toBe("function");
   expect(typeof reify.listDocs).toBe("function");
+  expect(typeof reify.formatValue).toBe("function");
 
   // Global ref-inspection registry API is intentionally not exported.
   expect("inspect" in reify).toBe(false);

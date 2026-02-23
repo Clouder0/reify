@@ -110,6 +110,25 @@ console.log(JSON.stringify(inspectTool(readText), null, 2));
 const s = await readText({ path: "README.md" });
 ```
 
+### Format arbitrary values for LLM display
+
+Tool calls often produce structured JS values. Use `formatValue()` to turn any value into a
+compact, prompt-safe string (defaults to a 20k char cap, stable ordering, and tail-preserving
+middle truncation).
+
+```ts
+import { formatValue, inspectTool } from "<REIFY_IMPORT>";
+import { readText } from "<REIFY_IMPORT>/kits/fs";
+
+console.log(formatValue(inspectTool(readText)));
+```
+
+You can override the cap when needed:
+
+```ts
+console.log(formatValue(inspectTool(readText), { maxChars: 5_000 }));
+```
+
 ### List tools/docs from a kit
 
 ```ts
