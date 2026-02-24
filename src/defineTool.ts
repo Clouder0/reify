@@ -13,7 +13,7 @@ export function defineTool<I extends BaseType, O extends BaseType>(def: {
   summary: string;
   input: I;
   output: O;
-  /** Hide from `listTools()` by default (internal tools). Defaults to `false`. */
+  /** Hide from `listTools()` by default (supported-but-unlisted tools). Defaults to `false`. */
   hidden?: boolean;
   validateOutput?: boolean;
   doc?: string;

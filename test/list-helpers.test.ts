@@ -10,11 +10,8 @@ import { listTools } from "../src/listTools";
 describe("kit-scoped listing helpers", () => {
   test("listTools(kit) returns a sorted summary index", () => {
     expect(listTools(fsKit)).toEqual([
-      { name: "listDir", summary: "List directory entries (optionally recursive)" },
-      { name: "readText", summary: "Read a file as UTF-8 text" },
       { name: "readTextWindow", summary: "Read a line window from a UTF-8 text file" },
       { name: "scanTree", summary: "Scan a directory into a bounded, deterministic nodes map" },
-      { name: "writeText", summary: "Write UTF-8 text to a file" },
     ]);
   });
 
@@ -55,7 +52,7 @@ describe("kit-scoped listing helpers", () => {
       { name: "concepts/paths", summary: "Concepts: paths and cwd" },
       { name: "index", summary: "Filesystem kit overview" },
       { name: "migrations", summary: "Breaking changes and migrations" },
-      { name: "recipes/read-write", summary: "Recipe: read-modify-write" },
+      { name: "recipes/browse-read", summary: "Recipe: browse + read" },
     ]);
 
     for (const item of docs) {

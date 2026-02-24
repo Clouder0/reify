@@ -1,10 +1,10 @@
 import { inspectTool, listDocs, listKits, listTools } from "@reify-ai/reify";
-import fsKit, { readText } from "@reify-ai/reify/kits/fs";
+import fsKit, { readTextWindow } from "@reify-ai/reify/kits/fs";
 
 console.log(listKits());
 console.log(listTools(fsKit));
 console.log(listDocs(fsKit));
-console.log(inspectTool(readText));
+console.log(inspectTool(readTextWindow));
 
-const s = await readText({ path: "SKILL.md" });
-console.log(s.slice(0, 80));
+const out = await readTextWindow({ path: "SKILL.md", startLine: 1, maxLines: 50 });
+console.log(out.text.slice(0, 80));

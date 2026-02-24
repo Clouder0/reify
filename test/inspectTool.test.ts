@@ -38,7 +38,7 @@ describe("inspectTool", () => {
     });
   });
 
-  test("includes hidden=true for internal tools", () => {
+  test("includes hidden=true for unlisted tools", () => {
     const t = defineTool({
       kit: "demo",
       name: "secret",

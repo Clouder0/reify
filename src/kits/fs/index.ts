@@ -1,5 +1,5 @@
 import { type as schema } from "arktype";
-import { opendir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
+import { opendir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 
 import { classifyDirent } from "./_dirent.js";
@@ -8,7 +8,7 @@ import { defineKit } from "../../defineKit.js";
 import type { Kit } from "../../types.js";
 
 const fsKitName = "fs";
-const fsKitSummary = "Filesystem operations (read/write/list)";
+const fsKitSummary = "Bounded filesystem browsing (scan + windowed reads)";
 export const fsKitImport = "@reify-ai/reify/kits/fs";
 
 function toolLink(name: string): string {
@@ -139,27 +139,6 @@ export const formatPath = defineTool({
   },
 });
 
-export const readText = defineTool({
-  kit: fsKitName,
-  name: "readText",
-  summary: "Read a file as UTF-8 text",
-  input: schema({
-    path: schema("string").describe("File path to read"),
-  }),
-  output: schema("string"),
-  doc: [
-    "Read the entire contents of a file as a UTF-8 string.",
-    "",
-    "Example:",
-    "```ts",
-    'const s = await readText({ path: "README.md" });',
-    "```",
-  ].join("\n"),
-  fn: async ({ path }) => {
-    return await readFile(path, "utf8");
-  },
-});
-
 export const readTextWindow = defineTool({
   kit: fsKitName,
   name: "readTextWindow",
@@ -223,75 +202,6 @@ export const readTextWindow = defineTool({
       endLine,
       nextStartLine: endLine < lines.length ? endLine + 1 : null,
     };
-  },
-});
-
-export const writeText = defineTool({
-  kit: fsKitName,
-  name: "writeText",
-  summary: "Write UTF-8 text to a file",
-  input: schema({
-    path: schema("string").describe("File path to write"),
-    content: schema("string").describe("Text content"),
-  }),
-  output: schema({ bytesWritten: "number" }),
-  doc: [
-    "Write text to a file (creates or overwrites).",
-    "",
-    "Example:",
-    "```ts",
-    'await writeText({ path: "out.txt", content: "hello" });',
-    "```",
-  ].join("\n"),
-  fn: async ({ path, content }) => {
-    await writeFile(path, content, "utf8");
-    return { bytesWritten: Buffer.byteLength(content, "utf8") };
-  },
-});
-
-export const listDir = defineTool({
-  kit: fsKitName,
-  name: "listDir",
-  summary: "List directory entries (optionally recursive)",
-  input: schema({
-    path: schema("string").describe("Directory path"),
-    recursive: schema("boolean").describe("List recursively").default(false),
-  }),
-  output: schema("string[]"),
-  doc: [
-    "List directory entries.",
-    "",
-    "- If `recursive` is false, returns the direct entries.",
-    "- If `recursive` is true, returns file paths relative to the given directory.",
-    "- Recursive mode skips symlinks to avoid path cycles and dangling-link errors.",
-    "",
-    "Example:",
-    "```ts",
-    'const entries = await listDir({ path: ".", recursive: false });',
-    "```",
-  ].join("\n"),
-  fn: async ({ path, recursive }) => {
-    if (!recursive) {
-      return (await readdir(path)).sort();
-    }
-
-    const out: string[] = [];
-
-    async function walk(dir: string, prefix = ""): Promise<void> {
-      const entries = await readdir(dir, { withFileTypes: true });
-      for (const entry of entries) {
-        const name = entry.name;
-        const full = join(dir, name);
-        const rel = prefix ? `${prefix}/${name}` : name;
-
-        if (entry.isSymbolicLink()) continue;
-        if (entry.isDirectory()) await walk(full, rel);
-        else out.push(rel);
-      }
-    }
-
-    await walk(path);
-    return out.sort();
   },
 });
 
@@ -388,7 +298,7 @@ export const scanTree = defineTool({
     "",
     "Output shape:",
     "- `root` is resolved via `realpath(path)` (a symlink passed as `path` is followed).",
-    `- \`root\` uses platform-native separators; for stable display strings use internal \`${toolLink("formatPath")}\`.`,
+    `- \`root\` uses platform-native separators; for stable display strings use the unlisted helper \`${toolLink("formatPath")}\`.`,
     "- `nodes` is a map keyed by root-relative POSIX paths (root key is `\".\"`).",
     "  - `nodes` has a null prototype; prefer `Object.hasOwn(nodes, key)` over `nodes.hasOwnProperty(...)`.",
     "- Each `DirListing` contains sorted `dirs` and `files` basenames.",
@@ -662,28 +572,33 @@ export const fsKit: Kit = defineKit({
       doc: [
         "# fs kit",
         "",
-        "Use this kit for basic local filesystem tasks.",
+        "Use this kit for bounded filesystem browsing and reading.",
         "",
-        "Tools:",
-        `- \`${toolLink("readText")}\``,
-        `- \`${toolLink("readTextWindow")}\``,
-        `- \`${toolLink("writeText")}\``,
-        `- \`${toolLink("listDir")}\``,
+        "Primary tools:",
         `- \`${toolLink("scanTree")}\``,
+        `- \`${toolLink("readTextWindow")}\``,
+        "",
+        "Supported-but-unlisted helpers:",
+        `- \`${toolLink("viewTree")}\``,
+        `- \`${toolLink("formatPath")}\``,
         "",
         "Docs:",
-        `- \`${docLink("recipes/read-write")}\``,
+        `- \`${docLink("recipes/browse-read")}\``,
       ].join("\n"),
     },
-    "recipes/read-write": {
-      summary: "Recipe: read-modify-write",
+    "recipes/browse-read": {
+      summary: "Recipe: browse + read",
       doc: [
-        "# Recipe: read-modify-write",
+        "# Recipe: browse + read",
         "",
         "```ts",
-        "import { readText, writeText } from \"@reify-ai/reify/kits/fs\";",
-        "const s = await readText({ path: \"a.txt\" });",
-        "await writeText({ path: \"a.txt\", content: s + \"\\nmore\" });",
+        "import { scanTree, viewTree, readTextWindow } from \"@reify-ai/reify/kits/fs\";",
+        "",
+        "const scan = await scanTree({ path: \".\", maxEntries: 300 });",
+        "console.log(await viewTree(scan));",
+        "",
+        "const page = await readTextWindow({ path: \"README.md\", startLine: 1, maxLines: 80 });",
+        "console.log(page.text);",
         "```",
       ].join("\n"),
     },
@@ -697,19 +612,28 @@ export const fsKit: Kit = defineKit({
     },
     migrations: {
       summary: "Breaking changes and migrations",
-      doc: "# Migrations\n\nNo migrations yet.",
+      doc: [
+        "# Migrations",
+        "",
+        "## Unreleased",
+        "",
+        "- Removed legacy/unbounded tools: `readText`, `writeText`, `listDir`.",
+        "- Use `readTextWindow` for bounded reads.",
+        "- Use `scanTree` (and supported-but-unlisted `viewTree`) for browsing.",
+      ].join("\n"),
     },
     changelog: {
       summary: "Recent changes",
-      doc: "# Changelog\n\nInitial version.",
+      doc: [
+        "# Changelog",
+        "",
+        "- Refined the fs kit surface to bounded browse/read tools; removed legacy helpers.",
+      ].join("\n"),
     },
   },
   tools: {
     formatPath,
-    readText,
     readTextWindow,
-    writeText,
-    listDir,
     scanTree,
     viewTree,
   },

@@ -22,7 +22,7 @@ describe("defineTool", () => {
     await expect(tool({ n: "nope" })).rejects.toBeInstanceOf(Error);
   });
 
-  test("supports meta.hidden for internal tools", async () => {
+  test("supports meta.hidden for unlisted tools", async () => {
     const tool = defineTool({
       kit: "k",
       name: "t",

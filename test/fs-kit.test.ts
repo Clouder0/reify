@@ -1,16 +1,23 @@
 import { expect, test } from "bun:test";
-import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import fsKit, { fsKitImport, listDir, readText, scanTree, viewTree } from "../src/kits/fs/index";
+import fsKit, { fsKitImport, readTextWindow, scanTree, viewTree } from "../src/kits/fs/index";
 
-test("scanTree doc mentions internal formatPath helper", () => {
+test("scanTree doc mentions unlisted formatPath helper", () => {
   expect(scanTree.meta.doc).toContain("formatPath");
   expect(scanTree.meta.doc).toContain(`reify:tool/${fsKitImport}#formatPath`);
 });
 
-test("fs kit reads and lists", async () => {
+test("fs kit exposes a bounded browse/read surface", async () => {
   expect(typeof fsKit.docs["index"].doc).toBe("string");
-  expect(fsKit.tools.readText).toBe(readText);
+
+  // Explicit wiring: kit.tools should reference the named exports.
+  expect(fsKit.tools.readTextWindow).toBe(readTextWindow);
+
+  // Legacy/unbounded tools are intentionally removed.
+  expect("readText" in fsKit.tools).toBe(false);
+  expect("writeText" in fsKit.tools).toBe(false);
+  expect("listDir" in fsKit.tools).toBe(false);
 
   const dir = join(process.cwd(), ".tmp-reify");
   await rm(dir, { recursive: true, force: true });
@@ -18,34 +25,8 @@ test("fs kit reads and lists", async () => {
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, "a.txt"), "hi", "utf8");
 
-    const s = await readText({ path: join(dir, "a.txt") });
-    expect(s).toBe("hi");
-
-    const entries = await listDir({ path: dir, recursive: false });
-    expect(entries).toContain("a.txt");
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("recursive listing skips dangling symlinks", async () => {
-  const dir = join(process.cwd(), ".tmp-reify-symlink");
-  await rm(dir, { recursive: true, force: true });
-  try {
-    await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, "a.txt"), "ok", "utf8");
-
-    try {
-      await symlink("./missing-target", join(dir, "dangling"));
-    } catch (error) {
-      // Some environments disallow symlink creation for unprivileged users.
-      if ((error as NodeJS.ErrnoException).code === "EPERM") return;
-      throw error;
-    }
-
-    const entries = await listDir({ path: dir, recursive: true });
-    expect(entries).toContain("a.txt");
-    expect(entries).not.toContain("dangling");
+    const out = await readTextWindow({ path: join(dir, "a.txt"), startLine: 1, maxLines: 10 });
+    expect(out.text).toBe("hi");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

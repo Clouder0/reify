@@ -54,14 +54,15 @@ Each kit module exports:
 Example usage:
 
 ```ts
-import fsKit, { readText } from "@reify-ai/reify/kits/fs";
+import fsKit, { readTextWindow } from "@reify-ai/reify/kits/fs";
 
 // Function-native calling (primary path)
-const s = await readText({ path: "README.md" });
+const out = await readTextWindow({ path: "README.md", startLine: 1, maxLines: 50 });
+console.log(out.text);
 
 // Kit navigation (docs + dynamic dispatch)
 const index = fsKit.docs["index"];
-const dynamic = fsKit.tools["readText"];
+const dynamic = fsKit.tools["readTextWindow"];
 ```
 
 ---
@@ -77,9 +78,12 @@ Tool metadata includes:
 - `kit`: kit name (string)
 - `name`: tool name (string)
 - `summary`: one-line description for listing
+- `hidden`: boolean (defaults to `false`); when `true`, the tool is supported but unlisted (omitted from `listTools(kit)`) to reduce index bloat.
 - `input`: ArkType object schema (single-object input enforced)
 - `output`: ArkType schema (required)
 - `doc?`: optional markdown (examples, nuance)
+
+`hidden` is for progressive disclosure only. It is not a security boundary and does not affect whether a tool exists in `kit.tools` or can be called.
 
 Tools are trusted code; outputs are not validated by default.
 Tool authors can opt in per tool with `validateOutput: true` in `defineTool`.
@@ -96,7 +100,7 @@ A kit is a plain object with:
 Docs are stored as a map (not an array) so a caller can directly access:
 
 ```ts
-kit.docs["recipes/read-write"]
+kit.docs["recipes/browse-read"]
 ```
 
 The `tools` table is for dynamic selection and enumeration; function-native usage should prefer named imports.
@@ -126,12 +130,16 @@ Why this exists:
 Reify avoids printing raw schema internals. Instead, `inspectTool(tool)` returns expression-first ArkType contract details suitable for:
 
 ```ts
-console.log(JSON.stringify(inspectTool(readText), null, 2));
+import { inspectTool } from "@reify-ai/reify";
+import { readTextWindow } from "@reify-ai/reify/kits/fs";
+
+console.log(JSON.stringify(inspectTool(readTextWindow), null, 2));
 ```
 
 Expected output shape:
 
 - `kit`, `name`, `summary`
+- `hidden?`: present and set to `true` for supported-but-unlisted tools; omitted otherwise.
 - `input`: `{ expression: string; description?: string }`
 - `output`: `{ expression: string; description?: string }`
 - `doc?`: markdown if provided
@@ -153,6 +161,7 @@ console.log(listDocs(fsKit));
 ```
 
 - `listTools(kit)` returns sorted `{ name, summary }` entries derived from `kit.tools`.
+- `listTools(kit)` omits tools where `tool.meta.hidden === true` (supported-but-unlisted helper tools).
 - `listDocs(kit)` returns sorted `{ name, summary }` entries derived from `kit.docs`.
 
 These are convenience helpers only; the source of truth remains `kit.tools` and `kit.docs`.
@@ -183,8 +192,8 @@ Docs may link to tools/docs using a fully-qualified convention that includes the
 
 Examples:
 
-- `reify:tool/@reify-ai/reify/kits/fs#readText`
-- `reify:doc/@reify-ai/reify/kits/fs#recipes/read-write`
+- `reify:tool/@reify-ai/reify/kits/fs#readTextWindow`
+- `reify:doc/@reify-ai/reify/kits/fs#recipes/browse-read`
 
 Resolution is deterministic:
 

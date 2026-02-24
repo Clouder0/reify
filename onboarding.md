@@ -47,7 +47,7 @@ node --input-type=module -e 'import("<REIFY_IMPORT>").then((r) => console.log(JS
 If that works, also verify you can inspect tool details and import a kit module:
 
 ```bash
-bun -e 'Promise.all([import("<REIFY_IMPORT>"), import("<REIFY_IMPORT>/kits/fs")]).then(([r, fs]) => console.log(JSON.stringify(r.inspectTool(fs.readText), null, 2)))'
+bun -e 'Promise.all([import("<REIFY_IMPORT>"), import("<REIFY_IMPORT>/kits/fs")]).then(([r, fs]) => console.log(JSON.stringify(r.inspectTool(fs.readTextWindow), null, 2)))'
 ```
 
 ## 3) Install The Reify Skill Doc
@@ -62,6 +62,7 @@ After installing the skill, your canonical workflow is:
 1. `listKits()`
 2. Import the kit module you want
 3. Use `listTools(kit)` / `listDocs(kit)` for compact indexes
+   - Note: `listTools(kit)` omits supported-but-unlisted helper tools (`tool.meta.hidden === true`) to reduce index bloat; kit docs may link to them.
 4. Read docs via `kit.docs[...]` when needed
 5. Use `inspectTool(tool)` to see exact input/output
 6. Import and call the tool

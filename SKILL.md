@@ -57,8 +57,11 @@ Reify is not only an API shape; it is an operating style for agent work.
   - Tools are async (`await` everything).
   - Output schemas exist for inspection; outputs are not validated by default, but authors can enable per-tool validation with `validateOutput: true` in `defineTool`.
 - **Kit surface**:
-  - `kit.docs` is a map: `kit.docs["index"]`, `kit.docs["recipes/read-write"]`, ...
+  - `kit.docs` is a map: `kit.docs["index"]`, `kit.docs["recipes/browse-read"]`, ...
   - `kit.tools` is a map for dynamic dispatch; prefer named imports for normal calling.
+- **Unlisted tools (`meta.hidden`)**:
+  - `listTools(kit)` is a curated index: tools with `tool.meta.hidden === true` are omitted to reduce index bloat.
+  - Unlisted tools are still supported and callable: they remain present in `kit.tools`, and kit docs may link to them via `reify:` tool links.
 - **Link convention** inside Markdown docs:
   - Tool: `reify:tool/<kitImport>#<toolName>`
   - Doc: `reify:doc/<kitImport>#<docName>`
@@ -71,7 +74,7 @@ Use the Reify philosophy above as your default loop across the whole task. The s
 0. Verify runtime with `bun --version` (or explicitly declare fallback if Bun is unavailable).
 1. Call `listKits()` to discover built-in kits and their import specifiers.
 2. Import the kit module you want.
-3. Use `listTools(kit)` / `listDocs(kit)` for compact progressive-disclosure indexes.
+3. Use `listTools(kit)` / `listDocs(kit)` for compact progressive-disclosure indexes (note: `listTools` omits unlisted tools).
 4. Read kit docs via `kit.docs[...]` when you need guidance.
 5. Inspect tool details via `inspectTool(tool)` when you need exact I/O.
 6. Import the tool by name and call it like normal code.
@@ -104,10 +107,11 @@ console.log(fsKit.docs["index"].doc);
 
 ```ts
 import { inspectTool } from "<REIFY_IMPORT>";
-import { readText } from "<REIFY_IMPORT>/kits/fs";
+import { readTextWindow } from "<REIFY_IMPORT>/kits/fs";
 
-console.log(JSON.stringify(inspectTool(readText), null, 2));
-const s = await readText({ path: "README.md" });
+console.log(JSON.stringify(inspectTool(readTextWindow), null, 2));
+const out = await readTextWindow({ path: "README.md", startLine: 1, maxLines: 50 });
+console.log(out.text);
 ```
 
 ### Format arbitrary values for LLM display
@@ -118,15 +122,15 @@ middle truncation).
 
 ```ts
 import { formatValue, inspectTool } from "<REIFY_IMPORT>";
-import { readText } from "<REIFY_IMPORT>/kits/fs";
+import { readTextWindow } from "<REIFY_IMPORT>/kits/fs";
 
-console.log(formatValue(inspectTool(readText)));
+console.log(formatValue(inspectTool(readTextWindow)));
 ```
 
 You can override the cap when needed:
 
 ```ts
-console.log(formatValue(inspectTool(readText), { maxChars: 5_000 }));
+console.log(formatValue(inspectTool(readTextWindow), { maxChars: 5_000 }));
 ```
 
 ### List tools/docs from a kit
@@ -147,3 +151,5 @@ console.log(listDocs(fsKit));
   - Fix by printing `inspectTool(tool).input.expression` and matching that contract exactly.
 - **Missing kit/tool/doc**: you imported the wrong kit module or used the wrong key.
   - Fix by starting from `listKits()`, then use `listTools(kit)` / `listDocs(kit)`.
+- **Tool not found in `listTools(kit)`**: it may be a supported-but-unlisted helper tool (`tool.meta.hidden === true`).
+  - Fix by following kit docs and/or checking the kit's `tools` table (`kit.tools["..."]`).
