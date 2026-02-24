@@ -66,8 +66,31 @@ test("scanTree clips per-directory and sets more to omitted direct children coun
   }
 });
 
-test("scanTree enforces maxDepth by emitting unexpanded child nodes with more: true", async () => {
+test("scanTree treats maxDepth as inclusive (root depth is 0)", async () => {
   const dir = join(process.cwd(), ".tmp-reify-scan-tree-depth");
+  await rm(dir, { recursive: true, force: true });
+  try {
+    await mkdir(join(dir, "deep", "inner"), { recursive: true });
+    await writeFile(join(dir, "deep", "inner", "x.txt"), "x", "utf8");
+
+    const out = await scanTree({
+      path: dir,
+      maxDepth: 0,
+      maxEntries: 100,
+      maxEntriesPerDir: 50,
+    });
+
+    expect(out.nodes["."].dirs).toEqual(["deep"]);
+    expect(out.nodes["deep"].more).toBe(true);
+    expect(out.nodes["deep"].dirs).toBeUndefined();
+    expect(out.nodes["deep"].files).toBeUndefined();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("scanTree expands directories up to maxDepth (inclusive) and marks deeper nodes with more: true", async () => {
+  const dir = join(process.cwd(), ".tmp-reify-scan-tree-depth-inclusive");
   await rm(dir, { recursive: true, force: true });
   try {
     await mkdir(join(dir, "deep", "inner"), { recursive: true });
@@ -81,10 +104,41 @@ test("scanTree enforces maxDepth by emitting unexpanded child nodes with more: t
     });
 
     expect(out.nodes["."].dirs).toEqual(["deep"]);
-    expect(out.nodes["deep"].more).toBe(true);
-    expect(out.nodes["deep"].dirs).toBeUndefined();
-    expect(out.nodes["deep"].files).toBeUndefined();
+    expect(out.nodes["deep"].dirs).toEqual(["inner"]);
+
+    // "inner" exists but is beyond maxDepth, so it is emitted as unexpanded.
+    expect(out.nodes["deep/inner"]).toBeTruthy();
+    expect(out.nodes["deep/inner"].more).toBe(true);
   } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("scanTree nodes map is safe for __proto__ directory names", async () => {
+  const dir = join(process.cwd(), ".tmp-reify-scan-tree-proto");
+  await rm(dir, { recursive: true, force: true });
+
+  const protoHadMore = Object.prototype.hasOwnProperty.call(Object.prototype, "more");
+  const protoMore = (Object.prototype as any).more;
+  try {
+    await mkdir(join(dir, "__proto__"), { recursive: true });
+    await writeFile(join(dir, "x.txt"), "x", "utf8");
+
+    const out = await scanTree({
+      path: dir,
+      // Use 1 so root is expanded even under the old (exclusive) semantics.
+      maxDepth: 1,
+      maxEntries: 100,
+      maxEntriesPerDir: 50,
+    });
+
+    expect(Object.getPrototypeOf(out.nodes)).toBe(null);
+    expect(Object.prototype.hasOwnProperty.call(out.nodes, "__proto__")).toBe(true);
+    expect(({} as any).more).toBeUndefined();
+  } finally {
+    if (!protoHadMore) delete (Object.prototype as any).more;
+    else (Object.prototype as any).more = protoMore;
+
     await rm(dir, { recursive: true, force: true });
   }
 });
@@ -111,6 +165,52 @@ test("scanTree enforces global maxEntries and marks unexpanded nodes with more: 
     // "a" is present but couldn't be expanded (budget exhausted).
     expect(out.nodes["a"]).toBeTruthy();
     expect(out.nodes["a"].more).toBe(true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("scanTree rejects non-integer or non-finite numeric limits", async () => {
+  const dir = join(process.cwd(), ".tmp-reify-scan-tree-limit-validation");
+  await rm(dir, { recursive: true, force: true });
+  try {
+    await mkdir(dir, { recursive: true });
+
+    await expect(
+      scanTree({
+        path: dir,
+        maxDepth: 1.5,
+        maxEntries: 100,
+        maxEntriesPerDir: 50,
+      }),
+    ).rejects.toThrow("maxDepth must be an integer >= 0");
+
+    await expect(
+      scanTree({
+        path: dir,
+        maxDepth: 1,
+        maxEntries: 100.5,
+        maxEntriesPerDir: 50,
+      }),
+    ).rejects.toThrow("maxEntries must be an integer >= 0");
+
+    await expect(
+      scanTree({
+        path: dir,
+        maxDepth: 1,
+        maxEntries: 100,
+        maxEntriesPerDir: 50.25,
+      }),
+    ).rejects.toThrow("maxEntriesPerDir must be an integer >= 0");
+
+    await expect(
+      scanTree({
+        path: dir,
+        maxDepth: 1,
+        maxEntries: Number.POSITIVE_INFINITY,
+        maxEntriesPerDir: 50,
+      }),
+    ).rejects.toThrow("maxEntries must be an integer >= 0");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

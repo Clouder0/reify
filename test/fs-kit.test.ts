@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import fsKit, { listDir, readText } from "../src/kits/fs/index";
+import fsKit, { listDir, readText, scanTree, viewTree } from "../src/kits/fs/index";
 
 test("fs kit reads and lists", async () => {
   expect(typeof fsKit.docs["index"].doc).toBe("string");
@@ -41,6 +41,35 @@ test("recursive listing skips dangling symlinks", async () => {
     const entries = await listDir({ path: dir, recursive: true });
     expect(entries).toContain("a.txt");
     expect(entries).not.toContain("dangling");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("scanTree output renders correctly via viewTree", async () => {
+  const dir = join(process.cwd(), ".tmp-reify-fs-tree-integration");
+  await rm(dir, { recursive: true, force: true });
+  try {
+    await mkdir(join(dir, "b"), { recursive: true });
+    await mkdir(join(dir, "a"), { recursive: true });
+    await writeFile(join(dir, "c.txt"), "c", "utf8");
+
+    const scan = await scanTree({
+      path: dir,
+      maxDepth: 1,
+      maxEntries: 100,
+      maxEntriesPerDir: 100,
+    });
+    const out = await viewTree(scan);
+
+    expect(out).toBe(
+      [
+        ".tmp-reify-fs-tree-integration/",
+        "  a/",
+        "  b/",
+        "  c.txt",
+      ].join("\n"),
+    );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

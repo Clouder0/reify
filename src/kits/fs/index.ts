@@ -1,8 +1,8 @@
 import { type as schema } from "arktype";
-import type { Dirent } from "node:fs";
-import { readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
+import { opendir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 
+import { classifyDirent } from "./_dirent.js";
 import { defineTool } from "../../defineTool.js";
 import { defineKit } from "../../defineKit.js";
 import type { Kit } from "../../types.js";
@@ -59,8 +59,8 @@ export type DirListing = {
 
   /**
    * Local incompleteness marker.
-   * - `true`: omitted children exist but count is unknown (depth/global early-stop).
-   * - `number`: omitted direct-children count (known).
+   * - `true`: directory was not expanded; contents unknown (depth/budget early-stop).
+   * - `number`: omitted eligible direct-children count (known, from clipping).
    */
   more?: true | number;
 
@@ -80,8 +80,8 @@ export type ScanTreeInput = {
   /** Root directory to scan. */
   path: string;
 
-  /** Maximum expansion depth (root is 0). */
-  maxDepth?: number;
+   /** Maximum expansion depth, inclusive (root is depth 0). */
+   maxDepth?: number;
 
   /** Global budget for emitted entries (dirs + files). */
   maxEntries?: number;
@@ -259,13 +259,56 @@ export const listDir = defineTool({
   },
 });
 
-function normalizeIntGE0(name: string, value: number, fallback: number): number {
-  const n = Number.isFinite(value) ? Math.floor(value) : fallback;
-  if (!Number.isInteger(n) || n < 0) {
+function normalizeIntGE0(name: string, value: number): number {
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
     throw new TypeError(`${name} must be an integer >= 0`);
   }
 
-  return n;
+  return value;
+}
+
+function heapSwap(heap: string[], i: number, j: number): void {
+  const tmp = heap[i];
+  heap[i] = heap[j];
+  heap[j] = tmp;
+}
+
+// Maintain a max-heap of the smallest K strings seen so far.
+function heapUpMax(heap: string[], idx: number): void {
+  while (idx > 0) {
+    const parent = (idx - 1) >> 1;
+    if (heap[parent] >= heap[idx]) return;
+    heapSwap(heap, parent, idx);
+    idx = parent;
+  }
+}
+
+function heapDownMax(heap: string[], idx: number): void {
+  const n = heap.length;
+  while (true) {
+    const left = idx * 2 + 1;
+    if (left >= n) return;
+    const right = left + 1;
+    let largest = left;
+    if (right < n && heap[right] > heap[left]) largest = right;
+    if (heap[idx] >= heap[largest]) return;
+    heapSwap(heap, idx, largest);
+    idx = largest;
+  }
+}
+
+function pushSmallestK(heap: string[], value: string, k: number): void {
+  if (k <= 0) return;
+  if (heap.length < k) {
+    heap.push(value);
+    heapUpMax(heap, heap.length - 1);
+    return;
+  }
+
+  // heap[0] is the largest of the kept "smallest K" values.
+  if (value >= heap[0]) return;
+  heap[0] = value;
+  heapDownMax(heap, 0);
 }
 
 function joinRelPosix(parent: string, name: string): string {
@@ -289,9 +332,11 @@ export const scanTree = defineTool({
   summary: "Scan a directory into a bounded, deterministic nodes map",
   input: schema({
     path: schema("string").describe("Root directory to scan"),
-    maxDepth: schema("number").describe("Maximum scan depth (0+)").default(6),
-    maxEntries: schema("number").describe("Global entry budget (0+)").default(500),
-    maxEntriesPerDir: schema("number").describe("Per-directory entry budget (0+)").default(50),
+    maxDepth: schema("number")
+      .describe("Maximum expansion depth, inclusive (integer 0+; root is depth 0)")
+      .default(6),
+    maxEntries: schema("number").describe("Global entry budget (integer 0+)").default(500),
+    maxEntriesPerDir: schema("number").describe("Per-directory entry budget (integer 0+)").default(50),
     excludeDirs: schema("string[]")
       .describe("Directory basenames to exclude")
       .default(() => [".git", "node_modules"]),
@@ -300,12 +345,25 @@ export const scanTree = defineTool({
   doc: [
     "Scan a directory tree into a bounded, deterministic map for progressive disclosure.",
     "",
+    "Depth semantics:",
+    "- `maxDepth` is inclusive and root is depth 0.",
+    "  - `maxDepth=0` lists only the root directory's direct children.",
+    "  - `maxDepth=1` also expands those child directories.",
+    "",
     "Output shape:",
+    "- `root` is resolved via `realpath(path)` (a symlink passed as `path` is followed).",
     "- `nodes` is a map keyed by root-relative POSIX paths (root key is `\".\"`).",
+    "  - `nodes` has a null prototype; prefer `Object.hasOwn(nodes, key)` over `nodes.hasOwnProperty(...)`.",
     "- Each `DirListing` contains sorted `dirs` and `files` basenames.",
-    "- `more: true` means the directory exists but wasn't expanded (depth/budget).",
-    "- `more: N` means `N` direct children were omitted (per-dir/global clipping).",
+    "- Under budgets, directories are included before files.",
+    "- `more: true` means the directory exists but wasn't expanded (depth/budget); contents unknown.",
+    "- `more: N` means `N` eligible direct children were omitted (per-dir/global clipping).",
     "- Symlinks are skipped.",
+    "- `excludeDirs` directories are omitted and not counted in `more`.",
+    "",
+    "Budget notes:",
+    "- Budgets bound output size; scanning very large directories can still be expensive.",
+    "- To keep results deterministic and compute exact omitted counts, entries are read and classified before clipping.",
     "",
     "Example:",
     "```ts",
@@ -321,9 +379,9 @@ export const scanTree = defineTool({
     maxEntriesPerDir,
     excludeDirs,
   }: ScanTreeInput): Promise<ScanTreeOutput> => {
-    const depthLimit = normalizeIntGE0("maxDepth", maxDepth ?? 6, 6);
-    let remaining = normalizeIntGE0("maxEntries", maxEntries ?? 500, 500);
-    const perDir = normalizeIntGE0("maxEntriesPerDir", maxEntriesPerDir ?? 50, 50);
+    const depthLimit = normalizeIntGE0("maxDepth", maxDepth ?? 6);
+    let remaining = normalizeIntGE0("maxEntries", maxEntries ?? 500);
+    const perDir = normalizeIntGE0("maxEntriesPerDir", maxEntriesPerDir ?? 50);
     const exclude = new Set(excludeDirs ?? [".git", "node_modules"]);
 
     const root = await realpath(path);
@@ -332,7 +390,9 @@ export const scanTree = defineTool({
       throw new TypeError("scanTree path must be an existing directory");
     }
 
-    const nodes: Record<string, DirListing> = { ".": {} };
+    // Use a null-prototype dictionary so paths like "__proto__" are safe keys.
+    const nodes = Object.create(null) as Record<string, DirListing>;
+    nodes["."] = {};
     const queue: Array<{ rel: string; depth: number }> = [{ rel: ".", depth: 0 }];
     const visited = new Set<string>();
 
@@ -348,7 +408,7 @@ export const scanTree = defineTool({
       }
       if (listing.error) continue;
 
-      if (depth >= depthLimit) {
+      if (depth > depthLimit) {
         listing.more ??= true;
         continue;
       }
@@ -359,37 +419,45 @@ export const scanTree = defineTool({
       }
 
       const full = fsPathForRel(root, rel);
-      let entries: Dirent[];
+      const includeLimit = Math.min(perDir, remaining);
+      let dirCount = 0;
+      let fileCount = 0;
+      const dirHeap: string[] = [];
+      const fileHeap: string[] = [];
+
+      let dir: Awaited<ReturnType<typeof opendir>> | undefined;
       try {
-        entries = await readdir(full, { withFileTypes: true });
+        dir = await opendir(full);
+        for await (const entry of dir) {
+          const kind = await classifyDirent(full, entry);
+          if (kind === "skip") continue;
+
+          if (kind === "dir") {
+            if (exclude.has(entry.name)) continue;
+            dirCount += 1;
+            pushSmallestK(dirHeap, entry.name, includeLimit);
+          } else {
+            fileCount += 1;
+            pushSmallestK(fileHeap, entry.name, includeLimit);
+          }
+        }
       } catch (err) {
         listing.error = errCode(err);
         continue;
-      }
-
-      const dirs: string[] = [];
-      const files: string[] = [];
-
-      for (const entry of entries) {
-        if (entry.isSymbolicLink()) continue;
-
-        if (entry.isDirectory()) {
-          if (exclude.has(entry.name)) continue;
-          dirs.push(entry.name);
-        } else {
-          files.push(entry.name);
+      } finally {
+        try {
+          await dir?.close();
+        } catch {
+          // Best-effort close.
         }
       }
 
-      dirs.sort();
-      files.sort();
-
-      const total = dirs.length + files.length;
-      const includeLimit = Math.min(perDir, remaining);
-      const includeDirs = dirs.slice(0, Math.min(dirs.length, includeLimit));
-      const leftover = includeLimit - includeDirs.length;
+      const total = dirCount + fileCount;
+      const includeDirCount = Math.min(dirCount, includeLimit);
+      const includeFileLimit = includeLimit - includeDirCount;
+      const includeDirs = includeDirCount > 0 ? dirHeap.slice().sort() : [];
       const includeFiles =
-        leftover > 0 ? files.slice(0, Math.min(files.length, leftover)) : [];
+        includeFileLimit > 0 ? fileHeap.slice().sort().slice(0, includeFileLimit) : [];
 
       const included = includeDirs.length + includeFiles.length;
       remaining -= included;
@@ -406,7 +474,7 @@ export const scanTree = defineTool({
           nodes[childRel] = child;
         }
 
-        if (depth + 1 >= depthLimit) {
+        if (depth + 1 > depthLimit) {
           child.more ??= true;
           continue;
         }
@@ -419,14 +487,60 @@ export const scanTree = defineTool({
   },
 });
 
+function isBidiControl(code: number): boolean {
+  return (
+    code === 0x061c ||
+    code === 0x200e ||
+    code === 0x200f ||
+    (code >= 0x202a && code <= 0x202e) ||
+    (code >= 0x2066 && code <= 0x2069)
+  );
+}
+
 function escapeTreeName(name: string): string {
-  // Preserve one-item-per-line rendering.
-  return name.replace(/\r/g, "\\r").replace(/\n/g, "\\n").replace(/\t/g, "\\t");
+  // Preserve one-item-per-line rendering and avoid terminal/log escape injection.
+  // POSIX filenames can contain ASCII control characters (incl. ESC), so we
+  // escape control characters and the most common display-spoofing Unicode
+  // controls (bidi) as visible sequences.
+  let out = "";
+  for (let i = 0; i < name.length; i += 1) {
+    const ch = name[i];
+    if (ch === "\n") {
+      out += "\\n";
+      continue;
+    }
+    if (ch === "\r") {
+      out += "\\r";
+      continue;
+    }
+    if (ch === "\t") {
+      out += "\\t";
+      continue;
+    }
+
+    const code = ch.charCodeAt(0);
+    // Escape C0 + DEL + C1 controls.
+    if (code <= 0x1f || code === 0x7f || (code >= 0x80 && code <= 0x9f)) {
+      out += `\\x${code.toString(16).padStart(2, "0")}`;
+      continue;
+    }
+
+    // Unicode line separators and bidi controls can break one-item-per-line or
+    // spoof display order in logs/terminals.
+    if (code === 0x2028 || code === 0x2029 || isBidiControl(code)) {
+      out += `\\u${code.toString(16).padStart(4, "0")}`;
+      continue;
+    }
+
+    out += ch;
+  }
+
+  return out;
 }
 
 function dirSuffix(listing: DirListing | undefined): string {
   if (!listing) return "/...";
-  if (listing.error) return `/! (${listing.error})`;
+  if (listing.error) return `/! (${escapeTreeName(listing.error)})`;
   if (listing.more !== undefined) {
     return listing.more === true ? "/..." : `/... (+${listing.more})`;
   }
@@ -444,6 +558,7 @@ export const viewTree = defineTool({
     "Render a `scanTree()` result into a token-efficient tree string.",
     "",
     "- Fixed format: 2-space indentation, directories first, then files.",
+    "- Names escape control characters for safe terminal/log rendering.",
     "- `name/...` means the directory is incomplete or unexpanded.",
     "- `name/... (+N)` includes the omitted direct children count when known.",
     "- `name/! (EACCES)` indicates an unreadable directory.",
@@ -458,11 +573,23 @@ export const viewTree = defineTool({
   fn: (scan: ScanTreeOutput) => {
     const nodes = scan.nodes;
     const rootListing = nodes["."];
-    const rootLabel = basename(scan.root) || scan.root;
+    const base = basename(scan.root);
+    // On Windows, path.basename("C:\\") is "". In that case, derive a label from the
+    // root path by trimming trailing separators. Only do this in the root fallback
+    // case so we don't corrupt legitimate POSIX basenames like "foo\\".
+    const rootLabel = base || scan.root.replace(/[\\/]+$/, "");
     const lines: string[] = [`${escapeTreeName(rootLabel)}${dirSuffix(rootListing)}`];
     const visited = new Set<string>();
 
-    function renderDir(rel: string, depth: number): void {
+    function ensureSorted(names: string[] | undefined): string[] {
+      if (!names || names.length <= 1) return names ?? [];
+      for (let i = 1; i < names.length; i += 1) {
+        if (names[i - 1] > names[i]) return names.slice().sort();
+      }
+      return names;
+    }
+
+    function walk(rel: string, depth: number): void {
       if (visited.has(rel)) return;
       visited.add(rel);
 
@@ -471,22 +598,19 @@ export const viewTree = defineTool({
 
       const indent = "  ".repeat(depth);
 
-      const dirs = (listing.dirs ?? []).slice().sort();
-      const files = (listing.files ?? []).slice().sort();
-
-      for (const name of dirs) {
+      for (const name of ensureSorted(listing.dirs)) {
         const childRel = rel === "." ? name : `${rel}/${name}`;
-        const child = nodes[childRel];
-        lines.push(`${indent}${escapeTreeName(name)}${dirSuffix(child)}`);
-        renderDir(childRel, depth + 1);
+        lines.push(`${indent}${escapeTreeName(name)}${dirSuffix(nodes[childRel])}`);
+        walk(childRel, depth + 1);
       }
 
-      for (const name of files) {
+      for (const name of ensureSorted(listing.files)) {
         lines.push(`${indent}${escapeTreeName(name)}`);
       }
     }
 
-    renderDir(".", 1);
+    walk(".", 1);
+
     return lines.join("\n");
   },
 });
