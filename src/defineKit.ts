@@ -36,6 +36,10 @@ function requireTool(value: unknown, label: string): asserts value is AnyTool {
   if (meta.doc !== undefined && typeof meta.doc !== "string") {
     throw new Error(`${label}.meta.doc must be a string when provided`);
   }
+  const hidden = (meta as { hidden?: unknown }).hidden;
+  if (hidden !== undefined && typeof hidden !== "boolean") {
+    throw new Error(`${label}.meta.hidden must be a boolean when provided`);
+  }
   if (!isSchemaContract(meta.input) || !isSchemaContract(meta.output)) {
     throw new Error(`${label}.meta must include input/output schema contracts`);
   }

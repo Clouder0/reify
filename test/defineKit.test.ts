@@ -132,4 +132,26 @@ describe("defineKit", () => {
       }),
     ).toThrow(/meta\.doc/i);
   });
+
+  test("throws if tool meta.hidden is present but not a boolean", () => {
+    const malformedHidden = Object.assign(async () => "ok", {
+      meta: {
+        kit: "demo",
+        name: "bad",
+        summary: "Malformed",
+        hidden: "true",
+        input: schema({ ok: "string" }),
+        output: schema("string"),
+      },
+    });
+
+    expect(() =>
+      defineKit({
+        name: "demo",
+        summary: "Demo kit",
+        docs: { index: { summary: "Overview", doc: "# Demo" } },
+        tools: { bad: malformedHidden as any },
+      }),
+    ).toThrow(/meta\.hidden/i);
+  });
 });

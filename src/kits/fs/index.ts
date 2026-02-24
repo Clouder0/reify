@@ -1,6 +1,6 @@
 import { type as schema } from "arktype";
 import { opendir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 
 import { classifyDirent } from "./_dirent.js";
 import { defineTool } from "../../defineTool.js";
@@ -102,6 +102,42 @@ const DirListingSchema = schema({
 
 const NodesSchema = schema({ "[string]": DirListingSchema });
 const ScanTreeOutputSchema = schema({ root: "string", nodes: NodesSchema });
+
+export const formatPath = defineTool({
+  kit: fsKitName,
+  name: "formatPath",
+  summary: "Resolve and format a filesystem path as an absolute string",
+  hidden: true,
+  input: schema({
+    path: schema("string").describe("Path to format (absolute or relative)"),
+    cwd: schema("string")
+      .describe("Base directory used to resolve relative paths")
+      .default(() => process.cwd()),
+    style: schema("'native' | 'posix'")
+      .describe("Separator style for the returned path")
+      .default("posix"),
+  }),
+  output: schema("string"),
+  doc: [
+    "Resolve + normalize a path for agent-friendly display.",
+    "",
+    "- Resolves `path` against `cwd` (default: `process.cwd()`).",
+    "- Pure formatting: no existence checks, no `realpath`/symlink resolution.",
+    "- On Windows, `style: \"posix\"` replaces `\\\\` with `/` for stable output.",
+    "",
+    "Example:",
+    "```ts",
+    'const p = await formatPath({ path: \"./foo\" });',
+    "```",
+  ].join("\n"),
+  fn: ({ path, cwd, style }) => {
+    const abs = resolve(cwd, path);
+    if (style === "posix" && process.platform === "win32") {
+      return abs.replace(/\\/g, "/");
+    }
+    return abs;
+  },
+});
 
 export const readText = defineTool({
   kit: fsKitName,
@@ -352,6 +388,7 @@ export const scanTree = defineTool({
     "",
     "Output shape:",
     "- `root` is resolved via `realpath(path)` (a symlink passed as `path` is followed).",
+    `- \`root\` uses platform-native separators; for stable display strings use internal \`${toolLink("formatPath")}\`.`,
     "- `nodes` is a map keyed by root-relative POSIX paths (root key is `\".\"`).",
     "  - `nodes` has a null prototype; prefer `Object.hasOwn(nodes, key)` over `nodes.hasOwnProperty(...)`.",
     "- Each `DirListing` contains sorted `dirs` and `files` basenames.",
@@ -552,6 +589,7 @@ export const viewTree = defineTool({
   kit: fsKitName,
   name: "viewTree",
   summary: "Render a scanTree() result as a compact indented tree",
+  hidden: true,
   input: ScanTreeOutputSchema,
   output: schema("string"),
   doc: [
@@ -632,7 +670,6 @@ export const fsKit: Kit = defineKit({
         `- \`${toolLink("writeText")}\``,
         `- \`${toolLink("listDir")}\``,
         `- \`${toolLink("scanTree")}\``,
-        `- \`${toolLink("viewTree")}\``,
         "",
         "Docs:",
         `- \`${docLink("recipes/read-write")}\``,
@@ -668,6 +705,7 @@ export const fsKit: Kit = defineKit({
     },
   },
   tools: {
+    formatPath,
     readText,
     readTextWindow,
     writeText,

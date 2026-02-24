@@ -9,6 +9,8 @@ export type ToolMeta<I extends BaseType, O extends BaseType> = {
   input: I;
   output: O;
   doc?: string;
+  /** Hide from `listTools()` by default (internal tools). Defaults to `false`. */
+  hidden: boolean;
 };
 
 export type Tool<I extends BaseType, O extends BaseType> =

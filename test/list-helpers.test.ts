@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { type as schema } from "arktype";
 
+import { defineKit } from "../src/defineKit";
+import { defineTool } from "../src/defineTool";
 import fsKit from "../src/kits/fs/index";
 import { listDocs } from "../src/listDocs";
 import { listTools } from "../src/listTools";
@@ -11,9 +14,38 @@ describe("kit-scoped listing helpers", () => {
       { name: "readText", summary: "Read a file as UTF-8 text" },
       { name: "readTextWindow", summary: "Read a line window from a UTF-8 text file" },
       { name: "scanTree", summary: "Scan a directory into a bounded, deterministic nodes map" },
-      { name: "viewTree", summary: "Render a scanTree() result as a compact indented tree" },
       { name: "writeText", summary: "Write UTF-8 text to a file" },
     ]);
+  });
+
+  test("listTools(kit) omits tools marked meta.hidden", () => {
+    const visible = defineTool({
+      kit: "demo",
+      name: "visible",
+      summary: "Visible",
+      input: schema({ n: "number" }),
+      output: schema("number"),
+      fn: async ({ n }) => n,
+    });
+
+    const hidden = defineTool({
+      kit: "demo",
+      name: "hidden",
+      summary: "Hidden",
+      hidden: true,
+      input: schema({ n: "number" }),
+      output: schema("number"),
+      fn: async ({ n }) => n,
+    });
+
+    const kit = defineKit({
+      name: "demo",
+      summary: "Demo kit",
+      docs: { index: { summary: "Overview", doc: "" } },
+      tools: { visible, hidden },
+    });
+
+    expect(listTools(kit)).toEqual([{ name: "visible", summary: "Visible" }]);
   });
 
   test("listDocs(kit) returns a sorted summary index", () => {

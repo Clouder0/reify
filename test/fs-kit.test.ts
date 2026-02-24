@@ -1,7 +1,12 @@
 import { expect, test } from "bun:test";
 import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import fsKit, { listDir, readText, scanTree, viewTree } from "../src/kits/fs/index";
+import fsKit, { fsKitImport, listDir, readText, scanTree, viewTree } from "../src/kits/fs/index";
+
+test("scanTree doc mentions internal formatPath helper", () => {
+  expect(scanTree.meta.doc).toContain("formatPath");
+  expect(scanTree.meta.doc).toContain(`reify:tool/${fsKitImport}#formatPath`);
+});
 
 test("fs kit reads and lists", async () => {
   expect(typeof fsKit.docs["index"].doc).toBe("string");

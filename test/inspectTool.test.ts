@@ -38,6 +38,21 @@ describe("inspectTool", () => {
     });
   });
 
+  test("includes hidden=true for internal tools", () => {
+    const t = defineTool({
+      kit: "demo",
+      name: "secret",
+      summary: "Internal",
+      hidden: true,
+      input: schema({ ok: "string" }),
+      output: schema({ ok: "string" }),
+      fn: async ({ ok }) => ({ ok }),
+    });
+
+    const info = inspectTool(t);
+    expect(info.hidden).toBe(true);
+  });
+
   test("throws a clear error when meta.input is malformed", () => {
     const malformedInput = Object.assign(async () => "ok", {
       meta: {
@@ -93,6 +108,21 @@ describe("inspectTool", () => {
     });
 
     expect(() => inspectTool(malformedDoc as any)).toThrow(/demo\.bad.*meta\.doc/i);
+  });
+
+  test("throws a clear error when meta.hidden is not a boolean", () => {
+    const malformedHidden = Object.assign(async () => "ok", {
+      meta: {
+        kit: "demo",
+        name: "bad",
+        summary: "Malformed",
+        hidden: "true",
+        input: schema({ ok: "string" }),
+        output: schema({ ok: "string" }),
+      },
+    });
+
+    expect(() => inspectTool(malformedHidden as any)).toThrow(/demo\.bad.*meta\.hidden/i);
   });
 
   test("throws a clear error when tool metadata is missing", () => {

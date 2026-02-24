@@ -15,10 +15,26 @@ describe("defineTool", () => {
 
     expect(tool.meta.kit).toBe("k");
     expect(tool.meta.name).toBe("t");
+    expect(tool.meta.hidden).toBe(false);
 
     await expect(tool({ n: 1 })).resolves.toBe(2);
     // @ts-expect-error - runtime should reject wrong shape
     await expect(tool({ n: "nope" })).rejects.toBeInstanceOf(Error);
+  });
+
+  test("supports meta.hidden for internal tools", async () => {
+    const tool = defineTool({
+      kit: "k",
+      name: "t",
+      summary: "s",
+      hidden: true,
+      input: schema({ n: "number" }),
+      output: schema("number"),
+      fn: async ({ n }) => n,
+    });
+
+    expect(tool.meta.hidden).toBe(true);
+    await expect(tool({ n: 1 })).resolves.toBe(1);
   });
 
   test("rejects non-object payloads even if schema is permissive", async () => {

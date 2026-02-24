@@ -10,6 +10,7 @@ export type InspectedTool = {
   kit: string;
   name: string;
   summary: string;
+  hidden?: boolean;
   input: InspectedSchema;
   output: InspectedSchema;
   doc?: string;
@@ -45,6 +46,7 @@ export function inspectTool(tool: AnyTool): InspectedTool {
     kit?: unknown;
     name?: unknown;
     summary?: unknown;
+    hidden?: unknown;
     input?: unknown;
     output?: unknown;
     doc?: unknown;
@@ -57,6 +59,12 @@ export function inspectTool(tool: AnyTool): InspectedTool {
   if (typeof metadata.summary !== "string") {
     throw new Error(
       `Cannot inspect tool ${metadata.kit}.${metadata.name}: meta.summary must be a string`,
+    );
+  }
+
+  if (metadata.hidden !== undefined && typeof metadata.hidden !== "boolean") {
+    throw new Error(
+      `Cannot inspect tool ${metadata.kit}.${metadata.name}: meta.hidden must be undefined or a boolean`,
     );
   }
 
@@ -82,6 +90,7 @@ export function inspectTool(tool: AnyTool): InspectedTool {
     kit: metadata.kit,
     name: metadata.name,
     summary: metadata.summary,
+    ...(metadata.hidden === true ? { hidden: true } : {}),
     input: inspectSchema(metadata.input),
     output: inspectSchema(metadata.output),
     doc: metadata.doc,
