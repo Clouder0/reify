@@ -1,8 +1,9 @@
 import { type as schema } from "arktype";
-import { opendir, readFile, realpath, stat } from "node:fs/promises";
+import { open, opendir, realpath, stat } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 
 import { classifyDirent } from "./_dirent.js";
+import { LineScanner, type LineScanSink } from "./_lineScanner.js";
 import { defineTool } from "../../defineTool.js";
 import { defineKit } from "../../defineKit.js";
 import type { Kit } from "../../types.js";
@@ -10,6 +11,14 @@ import type { Kit } from "../../types.js";
 const fsKitName = "fs";
 const fsKitSummary = "Bounded filesystem browsing (scan + windowed reads)";
 export const fsKitImport = "@reify-ai/reify/kits/fs";
+
+const READ_CHUNK_BYTES = 64 * 1024;
+
+// Hard caps: callers can always request smaller budgets, but allowing arbitrarily
+// large budgets defeats the kit's "bounded browsing" posture.
+const MAX_SCAN_TREE_DEPTH = 32;
+const MAX_SCAN_TREE_ENTRIES = 5000;
+const MAX_SCAN_TREE_ENTRIES_PER_DIR = 500;
 
 function toolLink(name: string): string {
   return `reify:tool/${fsKitImport}#${name}`;
@@ -19,35 +28,41 @@ function docLink(name: string): string {
   return `reify:doc/${fsKitImport}#${name}`;
 }
 
-function splitLinesWithEndings(text: string): string[] {
-  if (text.length === 0) return [];
+async function scanUtf8TextFile(
+  path: string,
+  scanner: LineScanner,
+  sink: LineScanSink,
+): Promise<{ stopped: boolean }> {
+  const fh = await open(path, "r");
+  try {
+    const decoder = new TextDecoder("utf-8");
+    const buf = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+    let stopped = false;
 
-  const lines: string[] = [];
-  let start = 0;
-  let i = 0;
-
-  while (i < text.length) {
-    const ch = text.charCodeAt(i);
-    if (ch !== 10 && ch !== 13) {
-      i += 1;
-      continue;
+    while (!stopped) {
+      const { bytesRead } = await fh.read(buf, 0, buf.length, null);
+      if (bytesRead === 0) break;
+      const chunk = decoder.decode(buf.subarray(0, bytesRead), { stream: true });
+      if (chunk.length > 0) {
+        stopped = scanner.write(chunk, sink);
+      }
     }
 
-    if (ch === 13 && i + 1 < text.length && text.charCodeAt(i + 1) === 10) {
-      i += 2;
-    } else {
-      i += 1;
+    if (!stopped) {
+      const tail = decoder.decode();
+      if (tail.length > 0) {
+        stopped = scanner.write(tail, sink);
+      }
     }
 
-    lines.push(text.slice(start, i));
-    start = i;
-  }
+    if (!stopped) {
+      stopped = scanner.end(sink);
+    }
 
-  if (start < text.length) {
-    lines.push(text.slice(start));
+    return { stopped };
+  } finally {
+    await fh.close();
   }
-
-  return lines;
 }
 
 export type DirListing = {
@@ -139,6 +154,65 @@ export const formatPath = defineTool({
   },
 });
 
+const DEFAULT_MAX_LINE_CHARS = 1024;
+const MAX_MAX_LINE_CHARS = 8192;
+const TRUNCATION_MARKER = "<<<REIFY_LINE_TRUNCATED>>>";
+
+function isHighSurrogate(codeUnit: number): boolean {
+  return codeUnit >= 0xd800 && codeUnit <= 0xdbff;
+}
+
+function isLowSurrogate(codeUnit: number): boolean {
+  return codeUnit >= 0xdc00 && codeUnit <= 0xdfff;
+}
+
+function safeTruncateUtf16(
+  text: string,
+  maxCodeUnits: number,
+  opts?: { treatAsTruncated?: boolean },
+): string {
+  if (maxCodeUnits <= 0) return "";
+
+  const end = Math.min(text.length, maxCodeUnits);
+  if (end === 0) return "";
+
+  // Avoid producing an unpaired high surrogate at the truncation boundary.
+  const isTruncating = end < text.length || opts?.treatAsTruncated === true;
+  if (isTruncating && isHighSurrogate(text.charCodeAt(end - 1))) {
+    return text.slice(0, end - 1);
+  }
+
+  return text.slice(0, end);
+}
+
+const ReadTextLineWindowHintInputSchema = schema({
+  path: "string",
+  line: "number",
+  startChar: "number",
+  maxChars: "number",
+});
+
+const ReadTextLineWindowHintSchema = schema({
+  toolRef: "string",
+  input: ReadTextLineWindowHintInputSchema,
+});
+
+const ReadTextWindowTruncationLineSchema = schema({
+  line: "number",
+  shownChars: "number",
+  omittedChars: "number",
+  nextStartChar: "number",
+  hint: ReadTextLineWindowHintSchema,
+});
+
+const ReadTextWindowTruncationSchema = schema("null").or(
+  schema({
+    maxLineChars: "number",
+    marker: "string",
+    lines: ReadTextWindowTruncationLineSchema.array(),
+  }),
+);
+
 export const readTextWindow = defineTool({
   kit: fsKitName,
   name: "readTextWindow",
@@ -147,12 +221,16 @@ export const readTextWindow = defineTool({
     path: schema("string").describe("File path to read"),
     startLine: schema("number").describe("1-based starting line").default(1),
     maxLines: schema("number").describe("Maximum number of lines (1-1000)").default(200),
+    maxLineChars: schema("number")
+      .describe("Maximum characters per line before truncation (1-8192)")
+      .default(DEFAULT_MAX_LINE_CHARS),
   }),
   output: schema({
     text: "string",
     startLine: "number",
     endLine: "number | null",
     nextStartLine: "number | null",
+    truncation: ReadTextWindowTruncationSchema,
   }),
   doc: [
     "Read a contiguous line window from a UTF-8 file.",
@@ -160,6 +238,10 @@ export const readTextWindow = defineTool({
     "- Line indexing is 1-based.",
     "- Defaults: `startLine = 1` and `maxLines = 200`.",
     "- `maxLines` must be an integer between 1 and 1000.",
+    `- Long lines are truncated by default to \`maxLineChars = ${DEFAULT_MAX_LINE_CHARS}\` characters (excluding the line ending).`,
+    "  - Character counting uses JS string offsets (UTF-16 code units). To avoid splitting surrogate pairs, the shown prefix may be shorter than maxLineChars.",
+    `  - When truncated, the returned \`text\` contains an inline marker: \`${TRUNCATION_MARKER}\`.`,
+    "  - Details + continuation hints are returned in the `truncation` field.",
     "- Line endings are preserved exactly (`\\n` and `\\r\\n`).",
     "- If `startLine` is past EOF, returns `text: \"\"`, `endLine: null`, `nextStartLine: null`.",
     "- `nextStartLine: null` means there are no more lines to read.",
@@ -169,7 +251,7 @@ export const readTextWindow = defineTool({
     'const out = await readTextWindow({ path: "README.md", startLine: 1, maxLines: 50 });',
     "```",
   ].join("\n"),
-  fn: async ({ path, startLine, maxLines }) => {
+  fn: async ({ path, startLine, maxLines, maxLineChars }) => {
     if (!Number.isInteger(startLine) || startLine < 1) {
       throw new TypeError("startLine must be an integer >= 1");
     }
@@ -182,25 +264,340 @@ export const readTextWindow = defineTool({
       throw new TypeError("maxLines must be <= 1000");
     }
 
-    const sourceText = await readFile(path, "utf8");
-    const lines = splitLinesWithEndings(sourceText);
+    if (!Number.isInteger(maxLineChars) || maxLineChars < 1) {
+      throw new TypeError("maxLineChars must be an integer >= 1");
+    }
 
-    if (startLine > lines.length) {
+    if (maxLineChars > MAX_MAX_LINE_CHARS) {
+      throw new TypeError(`maxLineChars must be <= ${MAX_MAX_LINE_CHARS}`);
+    }
+
+    const windowEndLine = startLine + maxLines - 1;
+
+    let lineNo = 0;
+    let endLine: number | null = null;
+    let nextStartLine: number | null = null;
+    let checkingForMore = false;
+
+    let currentContentLen = 0;
+    let currentPrefix = "";
+    const resetCurrent = () => {
+      currentContentLen = 0;
+      currentPrefix = "";
+    };
+
+    const truncations: Array<{
+      line: number;
+      shownChars: number;
+      omittedChars: number;
+      nextStartChar: number;
+      hint: { toolRef: string; input: { path: string; line: number; startChar: number; maxChars: number } };
+    }> = [];
+
+    const rendered: string[] = [];
+
+    const scanner = new LineScanner();
+    const sink: LineScanSink = {
+      onContent: (segment) => {
+        if (checkingForMore) {
+          if (segment.length > 0) {
+            nextStartLine = (endLine ?? windowEndLine) + 1;
+            return true;
+          }
+          return;
+        }
+
+        const currentLine = lineNo + 1;
+        if (currentLine < startLine || currentLine > windowEndLine) return;
+
+        currentContentLen += segment.length;
+        if (currentPrefix.length < maxLineChars) {
+          const remaining = maxLineChars - currentPrefix.length;
+          currentPrefix += segment.slice(0, remaining);
+        }
+      },
+      onLineEnd: (eol) => {
+        if (checkingForMore) {
+          nextStartLine = (endLine ?? windowEndLine) + 1;
+          return true;
+        }
+
+        const completedLine = lineNo + 1;
+
+        if (completedLine < startLine) {
+          lineNo += 1;
+          resetCurrent();
+          return;
+        }
+
+        if (completedLine > windowEndLine) {
+          lineNo += 1;
+          resetCurrent();
+          return;
+        }
+
+        if (currentContentLen <= maxLineChars) {
+          rendered.push(`${currentPrefix}${eol}`);
+        } else {
+          const shown = safeTruncateUtf16(currentPrefix, maxLineChars, { treatAsTruncated: true });
+          rendered.push(`${shown}${TRUNCATION_MARKER}${eol}`);
+          const shownChars = shown.length;
+          truncations.push({
+            line: completedLine,
+            shownChars,
+            omittedChars: currentContentLen - shownChars,
+            nextStartChar: shownChars,
+            hint: {
+              toolRef: toolLink("readTextLineWindow"),
+              input: {
+                path,
+                line: completedLine,
+                startChar: shownChars,
+                // readTextLineWindow enforces surrogate-pair safety. If maxLineChars=1
+                // and the next character is astral (2 UTF-16 code units), a maxChars=1
+                // hint would be unusable.
+                maxChars: Math.max(2, maxLineChars),
+              },
+            },
+          });
+        }
+
+        endLine = completedLine;
+        lineNo += 1;
+        resetCurrent();
+
+        if (completedLine === windowEndLine) {
+          if (eol === "") {
+            nextStartLine = null;
+          } else {
+            checkingForMore = true;
+          }
+        }
+      },
+    };
+
+    await scanUtf8TextFile(path, scanner, sink);
+
+    if (endLine === null) {
       return {
         text: "",
         startLine,
         endLine: null,
         nextStartLine: null,
+        truncation: null,
       };
     }
 
-    const window = lines.slice(startLine - 1, startLine - 1 + maxLines);
-    const endLine = startLine + window.length - 1;
     return {
-      text: window.join(""),
+      text: rendered.join(""),
       startLine,
       endLine,
-      nextStartLine: endLine < lines.length ? endLine + 1 : null,
+      nextStartLine,
+      truncation:
+        truncations.length === 0
+          ? null
+          : {
+              maxLineChars,
+              marker: TRUNCATION_MARKER,
+              lines: truncations,
+            },
+    };
+  },
+});
+
+export const readTextLineWindow = defineTool({
+  kit: fsKitName,
+  name: "readTextLineWindow",
+  summary: "Read a character window within a single line (helper)",
+  hidden: true,
+  input: schema({
+    path: schema("string").describe("File path to read"),
+    line: schema("number").describe("1-based line number to page within"),
+    startChar: schema("number")
+      .describe("0-based starting character offset within the line")
+      .default(0),
+    maxChars: schema("number")
+      .describe("Maximum characters to return (1-8192)")
+      .default(DEFAULT_MAX_LINE_CHARS),
+  }),
+  output: schema({
+    found: "boolean",
+    line: "number",
+    startChar: "number",
+    endChar: "number | null",
+    nextStartChar: "number | null",
+    text: "string",
+    eol: "string",
+  }),
+  doc: [
+    "Read a bounded character window within a single line.",
+    "",
+    "This is a supported-but-unlisted helper used for progressive disclosure when `readTextWindow` truncates long lines.",
+    "",
+    "Notes:",
+    "- Line indexing is 1-based.",
+    "- `startChar` and `maxChars` operate on JS string character offsets (UTF-16 code units).",
+    "- The returned `text` never includes the line ending; the original ending is returned as `eol`.",
+    "- `nextStartChar: null` means there are no more characters in the line.",
+    "",
+    "Example:",
+    "```ts",
+    'const chunk = await readTextLineWindow({ path: "README.md", line: 10, startChar: 0, maxChars: 200 });',
+    "```",
+  ].join("\n"),
+  fn: async ({ path, line, startChar, maxChars }) => {
+    if (!Number.isInteger(line) || line < 1) {
+      throw new TypeError("line must be an integer >= 1");
+    }
+
+    if (!Number.isInteger(startChar) || startChar < 0) {
+      throw new TypeError("startChar must be an integer >= 0");
+    }
+
+    if (!Number.isInteger(maxChars) || maxChars < 1) {
+      throw new TypeError("maxChars must be an integer >= 1");
+    }
+
+    if (maxChars > MAX_MAX_LINE_CHARS) {
+      throw new TypeError(`maxChars must be <= ${MAX_MAX_LINE_CHARS}`);
+    }
+
+    // Stream the file until we reach the target line, then page within it.
+    const targetEndCandidate = startChar + maxChars;
+
+    let lineNo = 0;
+    let currentPos = 0;
+    let prevCodeUnitInLine: number | null = null;
+
+    let outText = "";
+    let pendingEndSurrogateCheck = false;
+    let startBoundaryChecked = startChar === 0;
+
+    let found = false;
+    let endChar: number | null = null;
+    let nextStartChar: number | null = null;
+    let eol = "";
+
+    const scanner = new LineScanner();
+    const sink: LineScanSink = {
+      onContent: (segment) => {
+        const currentLine = lineNo + 1;
+        if (currentLine !== line) return;
+
+        // If we ended exactly at the candidate boundary on the prior segment,
+        // the next code unit is the first of this segment.
+        if (pendingEndSurrogateCheck && segment.length > 0) {
+          const nextCu = segment.charCodeAt(0);
+          if (isLowSurrogate(nextCu)) {
+            outText = outText.slice(0, -1);
+            if (outText.length === 0) {
+              throw new TypeError(
+                "maxChars is too small to return a slice without splitting a surrogate pair",
+              );
+            }
+          }
+          pendingEndSurrogateCheck = false;
+        }
+
+        // Validate the start boundary when we first reach it.
+        if (!startBoundaryChecked && startChar > 0) {
+          const rel = startChar - currentPos;
+          if (rel >= 0 && rel < segment.length) {
+            const cur = segment.charCodeAt(rel);
+            const prev = rel === 0 ? prevCodeUnitInLine : segment.charCodeAt(rel - 1);
+            if (prev !== null && isHighSurrogate(prev) && isLowSurrogate(cur)) {
+              throw new TypeError("startChar must not point into the middle of a surrogate pair");
+            }
+            startBoundaryChecked = true;
+          }
+        }
+
+        const segStart = currentPos;
+        const segEnd = currentPos + segment.length;
+
+        const collectStart = Math.max(segStart, startChar);
+        const collectEnd = Math.min(segEnd, targetEndCandidate);
+        if (collectStart < collectEnd) {
+          outText += segment.slice(collectStart - segStart, collectEnd - segStart);
+        }
+
+        // If we reached the candidate end within this segment, ensure we didn't split a surrogate pair.
+        if (segStart < targetEndCandidate && segEnd >= targetEndCandidate) {
+          const lastCu = outText.length > 0 ? outText.charCodeAt(outText.length - 1) : null;
+          const endsHigh = lastCu !== null && isHighSurrogate(lastCu);
+
+          if (segEnd > targetEndCandidate) {
+            const nextCu = segment.charCodeAt(targetEndCandidate - segStart);
+            if (endsHigh && isLowSurrogate(nextCu)) {
+              outText = outText.slice(0, -1);
+              if (outText.length === 0) {
+                throw new TypeError(
+                  "maxChars is too small to return a slice without splitting a surrogate pair",
+                );
+              }
+            }
+            pendingEndSurrogateCheck = false;
+          } else {
+            pendingEndSurrogateCheck = endsHigh;
+          }
+        }
+
+        currentPos = segEnd;
+        if (segment.length > 0) {
+          prevCodeUnitInLine = segment.charCodeAt(segment.length - 1);
+        }
+      },
+      onLineEnd: (lineEol) => {
+        const completedLine = lineNo + 1;
+
+        if (completedLine < line) {
+          lineNo += 1;
+          return;
+        }
+
+        if (completedLine === line) {
+          found = true;
+          eol = lineEol;
+          pendingEndSurrogateCheck = false;
+
+          const contentLen = currentPos;
+          if (startChar > contentLen) {
+            throw new TypeError("startChar must be <= line length");
+          }
+
+          const end = startChar + outText.length;
+          endChar = end;
+          nextStartChar = end < contentLen ? end : null;
+          return true;
+        }
+
+        // We passed the target line; stop scanning.
+        return true;
+      },
+    };
+
+    await scanUtf8TextFile(path, scanner, sink);
+
+    if (!found) {
+      return {
+        found: false,
+        line,
+        startChar,
+        endChar: null,
+        nextStartChar: null,
+        text: "",
+        eol: "",
+      };
+    }
+
+    return {
+      found: true,
+      line,
+      startChar,
+      endChar,
+      nextStartChar,
+      text: outText,
+      eol,
     };
   },
 });
@@ -279,10 +676,16 @@ export const scanTree = defineTool({
   input: schema({
     path: schema("string").describe("Root directory to scan"),
     maxDepth: schema("number")
-      .describe("Maximum expansion depth, inclusive (integer 0+; root is depth 0)")
+      .describe(
+        `Maximum expansion depth, inclusive (integer 0+; root is depth 0; hard cap: ${MAX_SCAN_TREE_DEPTH})`,
+      )
       .default(6),
-    maxEntries: schema("number").describe("Global entry budget (integer 0+)").default(500),
-    maxEntriesPerDir: schema("number").describe("Per-directory entry budget (integer 0+)").default(50),
+    maxEntries: schema("number")
+      .describe(`Global entry budget (integer 0+; hard cap: ${MAX_SCAN_TREE_ENTRIES})`)
+      .default(500),
+    maxEntriesPerDir: schema("number")
+      .describe(`Per-directory entry budget (integer 0+; hard cap: ${MAX_SCAN_TREE_ENTRIES_PER_DIR})`)
+      .default(50),
     excludeDirs: schema("string[]")
       .describe("Directory basenames to exclude")
       .default(() => [".git", "node_modules"]),
@@ -310,6 +713,7 @@ export const scanTree = defineTool({
     "",
     "Budget notes:",
     "- Budgets bound output size; scanning very large directories can still be expensive.",
+    `- Hard caps: maxDepth <= ${MAX_SCAN_TREE_DEPTH}, maxEntries <= ${MAX_SCAN_TREE_ENTRIES}, maxEntriesPerDir <= ${MAX_SCAN_TREE_ENTRIES_PER_DIR}.`,
     "- To keep results deterministic and compute exact omitted counts, entries are read and classified before clipping.",
     "",
     "Example:",
@@ -329,6 +733,18 @@ export const scanTree = defineTool({
     const depthLimit = normalizeIntGE0("maxDepth", maxDepth ?? 6);
     let remaining = normalizeIntGE0("maxEntries", maxEntries ?? 500);
     const perDir = normalizeIntGE0("maxEntriesPerDir", maxEntriesPerDir ?? 50);
+
+    if (depthLimit > MAX_SCAN_TREE_DEPTH) {
+      throw new TypeError(`maxDepth must be <= ${MAX_SCAN_TREE_DEPTH}`);
+    }
+
+    if (remaining > MAX_SCAN_TREE_ENTRIES) {
+      throw new TypeError(`maxEntries must be <= ${MAX_SCAN_TREE_ENTRIES}`);
+    }
+
+    if (perDir > MAX_SCAN_TREE_ENTRIES_PER_DIR) {
+      throw new TypeError(`maxEntriesPerDir must be <= ${MAX_SCAN_TREE_ENTRIES_PER_DIR}`);
+    }
     const exclude = new Set(excludeDirs ?? [".git", "node_modules"]);
 
     const root = await realpath(path);
@@ -579,6 +995,7 @@ export const fsKit: Kit = defineKit({
         `- \`${toolLink("readTextWindow")}\``,
         "",
         "Supported-but-unlisted helpers:",
+        `- \`${toolLink("readTextLineWindow")}\``,
         `- \`${toolLink("viewTree")}\``,
         `- \`${toolLink("formatPath")}\``,
         "",
@@ -599,6 +1016,7 @@ export const fsKit: Kit = defineKit({
         "",
         "const page = await readTextWindow({ path: \"README.md\", startLine: 1, maxLines: 80 });",
         "console.log(page.text);",
+        "if (page.truncation) console.log(page.truncation);",
         "```",
       ].join("\n"),
     },
@@ -618,6 +1036,9 @@ export const fsKit: Kit = defineKit({
         "## Unreleased",
         "",
         "- Removed legacy/unbounded tools: `readText`, `writeText`, `listDir`.",
+        "- `readTextWindow` now truncates very long lines by default and returns `truncation` metadata.",
+        `  - Use the supported-but-unlisted helper \`${toolLink("readTextLineWindow")}\` to page within a long line.`,
+        "- `scanTree` now enforces hard caps on maxDepth/maxEntries/maxEntriesPerDir to keep results bounded.",
         "- Use `readTextWindow` for bounded reads.",
         "- Use `scanTree` (and supported-but-unlisted `viewTree`) for browsing.",
       ].join("\n"),
@@ -628,11 +1049,13 @@ export const fsKit: Kit = defineKit({
         "# Changelog",
         "",
         "- Refined the fs kit surface to bounded browse/read tools; removed legacy helpers.",
+        "- `readTextWindow` now truncates very long lines by default; added hidden `readTextLineWindow` helper.",
       ].join("\n"),
     },
   },
   tools: {
     formatPath,
+    readTextLineWindow,
     readTextWindow,
     scanTree,
     viewTree,

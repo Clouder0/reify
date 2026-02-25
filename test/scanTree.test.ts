@@ -216,6 +216,28 @@ test("scanTree rejects non-integer or non-finite numeric limits", async () => {
   }
 });
 
+test("scanTree enforces hard caps on maxDepth/maxEntries/maxEntriesPerDir", async () => {
+  const dir = join(process.cwd(), ".tmp-reify-scan-tree-caps");
+  await rm(dir, { recursive: true, force: true });
+  try {
+    await mkdir(dir, { recursive: true });
+
+    await expect(
+      scanTree({ path: dir, maxDepth: 33, maxEntries: 100, maxEntriesPerDir: 50 }),
+    ).rejects.toThrow("maxDepth must be <=");
+
+    await expect(
+      scanTree({ path: dir, maxDepth: 1, maxEntries: 5001, maxEntriesPerDir: 50 }),
+    ).rejects.toThrow("maxEntries must be <=");
+
+    await expect(
+      scanTree({ path: dir, maxDepth: 1, maxEntries: 100, maxEntriesPerDir: 501 }),
+    ).rejects.toThrow("maxEntriesPerDir must be <=");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("scanTree skips symlinks", async () => {
   const dir = join(process.cwd(), ".tmp-reify-scan-tree-symlink");
   await rm(dir, { recursive: true, force: true });
