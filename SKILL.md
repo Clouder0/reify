@@ -38,6 +38,7 @@ Reify is not only an API shape; it is an operating style for agent work.
 - **Use progressive disclosure everywhere**: start from compact indexes/summaries, then drill into details only when needed.
 - **Keep contracts explicit**: prefer structured inputs/outputs, typed boundaries, and inspectable metadata over ad-hoc strings.
 - **Evidence before claims**: verify with fresh command/tool output before stating success.
+- **Token efficiency**: tool outputs become part of the LLM context. Use `formatValue()` instead of `JSON.stringify()` to keep results compact.
 
 ## What Reify Provides
 
@@ -125,23 +126,34 @@ await someTool({ cursor });
 // Equivalent to: await someTool({})
 ```
 
-### Format arbitrary values for LLM display
+### Format values for LLM consumption (use formatValue, not JSON.stringify)
 
-Tool calls often produce structured JS values. Use `formatValue()` to turn any value into a
-compact, prompt-safe string (defaults to a 20k char cap, stable ordering, and tail-preserving
-middle truncation).
+**CRITICAL**: Tool call results are returned to the LLM as strings and consume context tokens. Always use `formatValue()` for structured output.
+
+**Why this matters**:
+- `JSON.stringify()` produces verbose output (2x indentation spaces, duplicate keys, no truncation)
+- `formatValue()` produces compact, token-efficient output (stable ordering, middle-truncation, configurable cap)
+- You are an LLM agent reading your own output - save tokens for YOUR context window
 
 ```ts
 import { formatValue, inspectTool } from "<REIFY_IMPORT>";
 import { readTextWindow } from "<REIFY_IMPORT>/kits/fs";
 
+// GOOD: Compact, LLM-friendly output
 console.log(formatValue(inspectTool(readTextWindow)));
+
+// BAD: Verbose, wastes tokens (DO NOT DO THIS)
+console.log(JSON.stringify(inspectTool(readTextWindow), null, 2));
 ```
 
-You can override the cap when needed:
+**Use formatValue for**:
+- Inspecting tool schemas with `inspectTool()`
+- Displaying search results, file listings, or any structured data
+- Your own exploration and debugging (console.log output you will read)
 
+**Override the cap when needed**:
 ```ts
-console.log(formatValue(inspectTool(readTextWindow), { maxChars: 5_000 }));
+console.log(formatValue(largeValue, { maxChars: 5_000 }));
 ```
 
 ### List tools/docs from a kit
@@ -158,6 +170,9 @@ console.log(listDocs(fsKit));
 
 - **Runtime drift**: defaulting to `node`/`npm`/`npx` by habit.
   - Fix by switching to Bun equivalents: `bun --eval`, `bun run`, `bun test`, `bun x`.
+- **Verbose output with JSON.stringify**: using `JSON.stringify(obj, null, 2)` wastes context tokens.
+  - Fix by using `formatValue(obj)` for all structured output you'll read.
+  - Remember: YOU are an LLM - verbose output consumes YOUR context window.
 - **ArkType input validation errors**: your input object doesn't match the tool schema.
   - Fix by printing `inspectTool(tool).input.expression` and matching that contract exactly.
 - **Missing kit/tool/doc**: you imported the wrong kit module or used the wrong key.

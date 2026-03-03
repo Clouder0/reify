@@ -10,6 +10,7 @@ import { listTools } from "../src/listTools";
 describe("kit-scoped listing helpers", () => {
   test("listTools(kit) returns a sorted summary index", () => {
     expect(listTools(fsKit)).toEqual([
+      { name: "editText", summary: "Replace a unique text occurrence in a file (CAS-safe)" },
       { name: "readTextWindow", summary: "Read a line window from a UTF-8 text file" },
       { name: "scanTree", summary: "Scan a directory into a bounded, deterministic nodes map" },
       { name: "searchText", summary: "Search text under a directory (ripgrep wrapper)" },

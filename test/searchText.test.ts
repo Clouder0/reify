@@ -450,7 +450,7 @@ test("searchText stops when rg emits an oversized JSON record", async () => {
   }
 });
 
-test("searchText throws on invalid pattern (fatal rg error)", async () => {
+test("searchText returns structured errors on invalid pattern (fatal rg error)", async () => {
   const dir = join(process.cwd(), ".tmp-reify-searchText-invalid-pattern");
   await rm(dir, { recursive: true, force: true });
   try {
@@ -458,7 +458,11 @@ test("searchText throws on invalid pattern (fatal rg error)", async () => {
     await writeFixture(dir);
 
     const searchText = requireSearchText();
-    await expect(searchText({ path: dir, pattern: "(" })).rejects.toThrow();
+    const result = await searchText({ path: dir, pattern: "(" });
+
+    expect(result.files.length).toBe(0);
+    expect(result.errors.length).toBeGreaterThan(0);
+    expect(result.errors[0]).toMatch(/regex|parse/i);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -483,3 +487,30 @@ if (process.platform === "win32") {
     }
   });
 }
+
+test("searchText returns structured errors on nonexistent path", async () => {
+  const searchText = requireSearchText();
+  const result = await searchText({ path: "/nonexistent-path-xyz-123", pattern: "test" });
+
+  expect(result.files.length).toBe(0);
+  expect(result.errors.length).toBeGreaterThan(0);
+  expect(result.errors[0]).toMatch(/no such file|not found|cannot/i);
+});
+
+test("searchText returns structured errors when path is not a directory", async () => {
+  const dir = join(process.cwd(), ".tmp-reify-searchText-not-dir");
+  await rm(dir, { recursive: true, force: true });
+  try {
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "file.txt"), "pattern\n", "utf8");
+
+    const searchText = requireSearchText();
+    const result = await searchText({ path: join(dir, "file.txt"), pattern: "test" });
+
+    expect(result.files.length).toBe(0);
+    expect(result.errors.length).toBeGreaterThan(0);
+    expect(result.errors[0]).toContain("directory");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

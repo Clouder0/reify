@@ -1,6 +1,6 @@
 import { type as schema } from "arktype";
 import { spawn } from "node:child_process";
-import { open, opendir, realpath, stat, type FileHandle } from "node:fs/promises";
+import { open, opendir, readFile, realpath, rename, stat, unlink, writeFile, type FileHandle } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 
 import { classifyDirent } from "./_dirent.js";
@@ -12,7 +12,7 @@ import { defineKit } from "../../defineKit.js";
 import type { Kit } from "../../types.js";
 
 const fsKitName = "fs";
-const fsKitSummary = "Bounded filesystem browsing (scan + search + windowed reads)";
+const fsKitSummary = "Bounded filesystem browsing (scan + search + windowed reads + CAS edits)";
 export const fsKitImport = "@reify-ai/reify/kits/fs";
 
 const READ_CHUNK_BYTES = 64 * 1024;
@@ -32,6 +32,8 @@ const MAX_SEARCH_TEXT_CONTEXT_LINES = 20;
 
 const DEFAULT_SEARCH_TEXT_RG_JSON_LINE_BYTES = 2 * 1024 * 1024;
 const MAX_SEARCH_TEXT_RG_JSON_LINE_BYTES = 8 * 1024 * 1024;
+
+const DEFAULT_EDIT_TEXT_MAX_CHARS = 1024 * 1024; // 1MB max file size
 
 const MIN_RIPGREP_VERSION = { major: 14, minor: 1, patch: 1 };
 const MIN_RIPGREP_VERSION_TEXT = `${MIN_RIPGREP_VERSION.major}.${MIN_RIPGREP_VERSION.minor}.${MIN_RIPGREP_VERSION.patch}`;
@@ -1621,10 +1623,28 @@ export const searchText = defineTool({
       }
     }
 
-    const root = await realpath(path);
-    const st = await stat(root);
-    if (!st.isDirectory()) {
-      throw new TypeError("searchText path must be an existing directory");
+    // Path validation: return structured error instead of throwing for consistency
+    let root: string;
+    try {
+      root = await realpath(path);
+      const st = await stat(root);
+      if (!st.isDirectory()) {
+        return {
+          root: path,
+          pattern,
+          truncated: false,
+          files: [],
+          errors: ["searchText path must be an existing directory"],
+        };
+      }
+    } catch (e) {
+      return {
+        root: path,
+        pattern,
+        truncated: false,
+        files: [],
+        errors: [e instanceof Error ? e.message : String(e)],
+      };
     }
 
     const rgPath = "rg";
@@ -1879,25 +1899,10 @@ export const searchText = defineTool({
       }
     }
 
-    if (
-      !truncated &&
-      typeof result.exitCode === "number" &&
-      result.exitCode > 1 &&
-      totalMatches === 0 &&
-      sawErrorEvent === false
-    ) {
-      // rg uses exit code 2 for both fatal errors (e.g. invalid regex) and
-      // non-fatal file errors; in --json mode the latter usually emit `error`
-      // events. If we didn't see any `error` events and we have no matches,
-      // treat this as a fatal invocation/pattern error.
-      const first = stderrTrimmed.split(/\r?\n/)[0];
-      const safeFirst = sanitizeForSingleLineError(first);
-      throw new TypeError(
-        safeFirst
-          ? `searchText failed: ${safeFirst}`
-          : `searchText failed (rg exit code ${result.exitCode})`,
-      );
-    }
+    // Note: rg exit code 2 with no error events and no matches indicates a fatal
+    // invocation/pattern error (e.g. invalid regex). The stderr message has already
+    // been added to the errors array above; we return it as a structured error
+    // rather than throwing, for consistent error handling across all failure modes.
 
     if (!truncated) {
       if (typeof result.exitCode === "number" && result.exitCode > 1) {
@@ -1921,6 +1926,272 @@ export const searchText = defineTool({
       files,
       ...(stats ? { stats } : {}),
       errors,
+    };
+  },
+});
+
+// ---------------------------------------------------------------------------
+// editText
+// ---------------------------------------------------------------------------
+
+function detectLineEnding(content: string): string {
+  const match = content.match(/\r\n|\r|\n/);
+  return match ? match[0] : "\n";
+}
+
+function normalizeLineEndings(text: string, lineEnding: string): string {
+  // Normalize all line endings in text to the target line ending
+  return text.replace(/\r\n|\r|\n/g, lineEnding);
+}
+
+const EditTextSuccessSchema = schema({
+  success: "true",
+  lineChanged: "number",
+  bytesWritten: "number",
+});
+
+const EditTextErrorSchema = schema({
+  success: "false",
+  error: "string",
+  errorCode: "string",
+  "matches?": "number",
+});
+
+const EditTextOutputSchema = EditTextSuccessSchema.or(EditTextErrorSchema);
+
+export const editText = defineTool({
+  kit: fsKitName,
+  name: "editText",
+  summary: "Replace a unique text occurrence in a file (CAS-safe)",
+  input: schema({
+    path: schema("string").describe("File path to edit"),
+    oldText: schema("string").describe("Content to replace (must be non-empty and match exactly once)"),
+    newText: schema("string").describe("Replacement content"),
+    startLine: schema("number > 0")
+      .describe("Optional: 1-based start line to narrow search scope")
+      .optional(),
+    endLine: schema("number > 0")
+      .describe("Optional: 1-based end line to narrow search scope (>= startLine)")
+      .optional(),
+  }),
+  output: EditTextOutputSchema,
+  doc: [
+    "Replace a unique occurrence of `oldText` with `newText` in a file.",
+    "",
+    "Safety guarantees:",
+    "- **CAS (Compare-And-Swap)**: `oldText` must match exactly once in the search scope.",
+    "- **Atomic write**: changes are written to a temp file, then renamed into place.",
+    "- **Line ending preservation**: detects the file's line ending style and normalizes `newText` to match.",
+    "",
+    "Optional `startLine`/`endLine` narrow the search scope (1-based, inclusive).",
+    "The scope is automatically extended by the number of lines in `oldText` to catch",
+    "matches that span line boundaries.",
+    "",
+    "Error codes:",
+    "- `FILE_NOT_FOUND` - file does not exist",
+    "- `FILE_READ_ERROR` - failed to read file",
+    "- `FILE_WRITE_ERROR` - failed to write file",
+    "- `INVALID_LINE_RANGE` - invalid startLine/endLine",
+    "- `OLD_TEXT_EMPTY` - oldText is empty",
+    "- `OLD_TEXT_NOT_FOUND` - oldText not found in scope",
+    "- `OLD_TEXT_NOT_UNIQUE` - oldText found multiple times globally",
+    "- `OLD_TEXT_NOT_UNIQUE_SCOPED` - oldText found multiple times in scoped range",
+    "",
+    "Example:",
+    "```ts",
+    'const result = await editText({',
+    '  path: "src/app.ts",',
+    '  oldText: "const x = 1;",',
+    '  newText: "const x = 2;",',
+    "});",
+    "```",
+  ].join("\n"),
+  fn: async ({ path, oldText, newText, startLine, endLine }) => {
+    // 1. Validate oldText is non-empty
+    if (oldText.length === 0) {
+      return {
+        success: false as const,
+        error: "oldText cannot be empty",
+        errorCode: "OLD_TEXT_EMPTY",
+      };
+    }
+
+    // 2. Validate line range
+    if (startLine !== undefined && endLine !== undefined && endLine < startLine) {
+      return {
+        success: false as const,
+        error: `Invalid line range: endLine (${endLine}) must be >= startLine (${startLine})`,
+        errorCode: "INVALID_LINE_RANGE",
+      };
+    }
+
+    // 3. Resolve and validate file path
+    const resolved = isAbsolute(path) ? path : resolve(process.cwd(), path);
+
+    let fileStat;
+    try {
+      fileStat = await stat(resolved);
+    } catch {
+      return {
+        success: false as const,
+        error: `File not found: ${path}`,
+        errorCode: "FILE_NOT_FOUND",
+      };
+    }
+
+    if (!fileStat.isFile()) {
+      return {
+        success: false as const,
+        error: `File not found: ${path} (path is not a regular file)`,
+        errorCode: "FILE_NOT_FOUND",
+      };
+    }
+
+    // 4. Read file content
+    let content: string;
+    try {
+      content = await readFile(resolved, "utf8");
+    } catch (err: unknown) {
+      const reason = err instanceof Error ? err.message : String(err);
+      return {
+        success: false as const,
+        error: `Failed to read file: ${reason}`,
+        errorCode: "FILE_READ_ERROR",
+      };
+    }
+
+    // 5. Check file size limit
+    if (content.length > DEFAULT_EDIT_TEXT_MAX_CHARS) {
+      return {
+        success: false as const,
+        error: `File too large for editText (${content.length} chars, limit ${DEFAULT_EDIT_TEXT_MAX_CHARS})`,
+        errorCode: "FILE_READ_ERROR",
+      };
+    }
+
+    // 6. Detect line ending style and normalize newText
+    const lineEnding = detectLineEnding(content);
+    const normalizedNewText = normalizeLineEndings(newText, lineEnding);
+
+    // 7. Determine search scope
+    let searchContent: string;
+    let scopeOffset: number; // byte offset where the scope starts in the full content
+    const isScoped = startLine !== undefined || endLine !== undefined;
+
+    if (isScoped) {
+      const lines = content.split(/\r\n|\r|\n/);
+      const totalLines = lines.length;
+
+      const effStart = startLine ?? 1;
+      const effEnd = endLine ?? totalLines;
+
+      if (effStart > totalLines) {
+        return {
+          success: false as const,
+          error: `Invalid line range: startLine (${effStart}) exceeds file length (${totalLines} lines)`,
+          errorCode: "INVALID_LINE_RANGE",
+        };
+      }
+
+      // Smart extension: extend by number of lines in oldText
+      const oldTextLineCount = oldText.split(/\r\n|\r|\n/).length;
+      const extendedStart = Math.max(1, effStart - oldTextLineCount);
+      const extendedEnd = Math.min(totalLines, effEnd + oldTextLineCount);
+
+      // Build the search scope text and compute offset
+      // We need the character offset of extendedStart within the original content
+      let charOffset = 0;
+      for (let i = 0; i < extendedStart - 1; i++) {
+        charOffset += lines[i].length + lineEnding.length;
+      }
+      scopeOffset = charOffset;
+
+      // Build scoped content from lines
+      const scopedLines = lines.slice(extendedStart - 1, extendedEnd);
+      searchContent = scopedLines.join(lineEnding);
+    } else {
+      searchContent = content;
+      scopeOffset = 0;
+    }
+
+    // 8. Count occurrences of oldText in scope
+    let count = 0;
+    let matchIndex = -1;
+    let pos = 0;
+    while (true) {
+      const idx = searchContent.indexOf(oldText, pos);
+      if (idx === -1) break;
+      count++;
+      matchIndex = idx;
+      pos = idx + 1;
+    }
+
+    // 9. Handle no match
+    if (count === 0) {
+      return {
+        success: false as const,
+        error: "oldText not found in file",
+        errorCode: "OLD_TEXT_NOT_FOUND",
+      };
+    }
+
+    // 10. Handle multiple matches
+    if (count > 1) {
+      if (isScoped) {
+        const effStart = startLine ?? 1;
+        const effEnd = endLine ?? "end";
+        return {
+          success: false as const,
+          error: `oldText found ${count} times in lines ${effStart}-${effEnd} - provide more context`,
+          errorCode: "OLD_TEXT_NOT_UNIQUE_SCOPED",
+          matches: count,
+        };
+      }
+      return {
+        success: false as const,
+        error: `oldText found ${count} times - provide more context or line constraints`,
+        errorCode: "OLD_TEXT_NOT_UNIQUE",
+        matches: count,
+      };
+    }
+
+    // 11. Unique match — perform the replacement
+    const globalMatchIndex = scopeOffset + matchIndex;
+    const newContent =
+      content.substring(0, globalMatchIndex) +
+      normalizedNewText +
+      content.substring(globalMatchIndex + oldText.length);
+
+    // Calculate 1-based line number where the change occurred
+    const beforeMatch = content.substring(0, globalMatchIndex);
+    const lineChanged = beforeMatch.split(/\r\n|\r|\n/).length;
+
+    // 12. Atomic write: temp file + rename
+    const tempPath = `${resolved}.tmp-edit-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    try {
+      await writeFile(tempPath, newContent, "utf8");
+      await rename(tempPath, resolved);
+    } catch (err: unknown) {
+      // Clean up temp file on failure
+      try {
+        await unlink(tempPath);
+      } catch {
+        // ignore cleanup errors
+      }
+      const reason = err instanceof Error ? err.message : String(err);
+      return {
+        success: false as const,
+        error: `Failed to write file: ${reason}`,
+        errorCode: "FILE_WRITE_ERROR",
+      };
+    }
+
+    const bytesWritten = Buffer.byteLength(newContent, "utf8");
+
+    return {
+      success: true as const,
+      lineChanged,
+      bytesWritten,
     };
   },
 });
@@ -2116,12 +2387,13 @@ export const fsKit: Kit = defineKit({
       doc: [
         "# fs kit",
         "",
-        "Use this kit for bounded filesystem browsing and reading.",
+        "Use this kit for bounded filesystem browsing, reading, and editing.",
         "",
         "Primary tools:",
         `- \`${toolLink("scanTree")}\``,
         `- \`${toolLink("searchText")}\``,
         `- \`${toolLink("readTextWindow")}\``,
+        `- \`${toolLink("editText")}\``,
         "",
         "Supported-but-unlisted helpers:",
         `- \`${toolLink("readTextLineWindow")}\``,
@@ -2174,6 +2446,7 @@ export const fsKit: Kit = defineKit({
         "- `scanTree` expanded default `excludeDirs` to skip common deps/env/cache directories (for example `.venv` and `target`).",
         "- Use `readTextWindow` for bounded reads.",
         "- Use `scanTree` (and supported-but-unlisted `viewTree`) for browsing.",
+        "- Added `editText` for CAS-safe text replacement with atomic writes.",
       ].join("\n"),
     },
     changelog: {
@@ -2186,10 +2459,12 @@ export const fsKit: Kit = defineKit({
         `- Added \`searchText\` for bounded, deterministic text search (ripgrep wrapper). Requires \`rg >= ${MIN_RIPGREP_VERSION_TEXT}\`.`,
         "- `readTextWindow` and `readTextLineWindow` now support negative line indexing for tail-style reads.",
         "- `scanTree` expanded default excludes to skip common deps/env/cache directories.",
+        "- Added `editText` for CAS-safe (Compare-And-Swap) text replacement with atomic writes.",
       ].join("\n"),
     },
   },
   tools: {
+    editText,
     formatPath,
     readTextLineWindow,
     readTextWindow,
