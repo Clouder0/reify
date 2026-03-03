@@ -50,6 +50,16 @@ If that works, also verify you can inspect tool details and import a kit module:
 bun -e 'Promise.all([import("<REIFY_IMPORT>"), import("<REIFY_IMPORT>/kits/fs")]).then(([r, fs]) => console.log(JSON.stringify(r.inspectTool(fs.readTextWindow), null, 2)))'
 ```
 
+### Optional: Verify ripgrep (for `fs.searchText`)
+
+`fs.searchText` uses ripgrep (`rg`) and requires `rg >= 14.1.1`.
+
+```bash
+rg --version
+```
+
+Expected: `ripgrep 14.1.1` (or newer).
+
 ## 3) Install The Reify Skill Doc
 
 Install the contents of `SKILL.md` into your agent host using your host's standard "skill"

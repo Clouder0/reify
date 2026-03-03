@@ -12,6 +12,7 @@ describe("kit-scoped listing helpers", () => {
     expect(listTools(fsKit)).toEqual([
       { name: "readTextWindow", summary: "Read a line window from a UTF-8 text file" },
       { name: "scanTree", summary: "Scan a directory into a bounded, deterministic nodes map" },
+      { name: "searchText", summary: "Search text under a directory (ripgrep wrapper)" },
     ]);
   });
 

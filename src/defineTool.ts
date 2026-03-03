@@ -7,6 +7,21 @@ function isObjectPayload(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function omitUndefinedShallow(value: Record<string, unknown>): Record<string, unknown> {
+  // Fast path: avoid copying unless we find an `undefined`.
+  for (const key of Object.keys(value)) {
+    if (value[key] === undefined) {
+      const out: Record<string, unknown> = { ...value };
+      for (const k of Object.keys(out)) {
+        if (out[k] === undefined) delete out[k];
+      }
+      return out;
+    }
+  }
+
+  return value;
+}
+
 export function defineTool<I extends BaseType, O extends BaseType>(def: {
   kit: string;
   name: string;
@@ -24,7 +39,8 @@ export function defineTool<I extends BaseType, O extends BaseType>(def: {
       throw new TypeError(`Tool ${def.kit}.${def.name} expects a single object input`);
     }
 
-    const parsed = def.input.assert(raw) as ObjectPayload<I["infer"]>;
+    const sanitized = omitUndefinedShallow(raw);
+    const parsed = def.input.assert(sanitized) as ObjectPayload<I["infer"]>;
     const result = await def.fn(parsed);
     if (def.validateOutput) {
       return def.output.assert(result);

@@ -37,6 +37,60 @@ describe("defineTool", () => {
     await expect(tool({ n: 1 })).resolves.toBe(1);
   });
 
+  test("treats top-level undefined keys as omitted", async () => {
+    const tool = defineTool({
+      kit: "k",
+      name: "t",
+      summary: "s",
+      input: schema({ "cursor?": "string" }),
+      output: schema({ hasCursor: "boolean" }),
+      fn: async (input) => ({
+        hasCursor: Object.prototype.hasOwnProperty.call(input, "cursor"),
+      }),
+    });
+
+    await expect(tool({ cursor: undefined })).resolves.toEqual({ hasCursor: false });
+  });
+
+  test("does not treat null as omitted", async () => {
+    const tool = defineTool({
+      kit: "k",
+      name: "t",
+      summary: "s",
+      input: schema({ "cursor?": "string" }),
+      output: schema("string"),
+      fn: async ({ cursor }) => cursor ?? "none",
+    });
+
+    await expect(tool({ cursor: null as any })).rejects.toBeInstanceOf(Error);
+  });
+
+  test("does not deep-strip undefined in nested objects", async () => {
+    const tool = defineTool({
+      kit: "k",
+      name: "t",
+      summary: "s",
+      input: schema({ inner: schema({ x: "string" }) }),
+      output: schema("string"),
+      fn: async ({ inner }) => inner.x,
+    });
+
+    await expect(tool({ inner: { x: undefined as any } })).rejects.toBeInstanceOf(Error);
+  });
+
+  test("still rejects undefined for required keys", async () => {
+    const tool = defineTool({
+      kit: "k",
+      name: "t",
+      summary: "s",
+      input: schema({ repo: "string" }),
+      output: schema("string"),
+      fn: async ({ repo }) => repo,
+    });
+
+    await expect(tool({ repo: undefined as any })).rejects.toBeInstanceOf(Error);
+  });
+
   test("rejects non-object payloads even if schema is permissive", async () => {
     const tool = defineTool({
       kit: "k",

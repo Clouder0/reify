@@ -54,6 +54,7 @@ Reify is not only an API shape; it is an operating style for agent work.
 
 - **Tool calling**:
   - Tools take exactly one input object (validated by ArkType contracts).
+  - Inputs are JSON-like: before validation, top-level keys whose value is exactly `undefined` are treated as omitted (shallow only). (`null` is still validated normally.)
   - Tools are async (`await` everything).
   - Output schemas exist for inspection; outputs are not validated by default, but authors can enable per-tool validation with `validateOutput: true` in `defineTool`.
 - **Kit surface**:
@@ -112,6 +113,16 @@ import { readTextWindow } from "<REIFY_IMPORT>/kits/fs";
 console.log(JSON.stringify(inspectTool(readTextWindow), null, 2));
 const out = await readTextWindow({ path: "README.md", startLine: 1, maxLines: 50 });
 console.log(out.text);
+```
+
+### Optional inputs: `undefined` means “omitted”
+
+Tool inputs are validated like JSON. Passing `undefined` for a top-level key is treated as omitting that key entirely (required keys must still be provided).
+
+```ts
+const cursor: string | undefined = undefined;
+await someTool({ cursor });
+// Equivalent to: await someTool({})
 ```
 
 ### Format arbitrary values for LLM display

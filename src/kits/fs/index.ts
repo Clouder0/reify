@@ -1,15 +1,18 @@
 import { type as schema } from "arktype";
-import { open, opendir, realpath, stat } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
+import { spawn } from "node:child_process";
+import { open, opendir, realpath, stat, type FileHandle } from "node:fs/promises";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 
 import { classifyDirent } from "./_dirent.js";
 import { LineScanner, type LineScanSink } from "./_lineScanner.js";
+import { collectTailLineRanges, type TailLineRange } from "./_tailLines.js";
+import { runRipgrepJson, type RunRipgrepJsonResult } from "./_ripgrepJson.js";
 import { defineTool } from "../../defineTool.js";
 import { defineKit } from "../../defineKit.js";
 import type { Kit } from "../../types.js";
 
 const fsKitName = "fs";
-const fsKitSummary = "Bounded filesystem browsing (scan + windowed reads)";
+const fsKitSummary = "Bounded filesystem browsing (scan + search + windowed reads)";
 export const fsKitImport = "@reify-ai/reify/kits/fs";
 
 const READ_CHUNK_BYTES = 64 * 1024;
@@ -19,6 +22,229 @@ const READ_CHUNK_BYTES = 64 * 1024;
 const MAX_SCAN_TREE_DEPTH = 32;
 const MAX_SCAN_TREE_ENTRIES = 5000;
 const MAX_SCAN_TREE_ENTRIES_PER_DIR = 500;
+
+const MAX_SEARCH_TEXT_MATCHES = 1000;
+const MAX_SEARCH_TEXT_FILES_WITH_MATCHES = 200;
+const MAX_SEARCH_TEXT_MATCHES_PER_FILE = 200;
+const MAX_SEARCH_TEXT_PREVIEW_CHARS = 1024;
+const MAX_SEARCH_TEXT_TIMEOUT_MS = 60_000;
+const MAX_SEARCH_TEXT_CONTEXT_LINES = 20;
+
+const DEFAULT_SEARCH_TEXT_RG_JSON_LINE_BYTES = 2 * 1024 * 1024;
+const MAX_SEARCH_TEXT_RG_JSON_LINE_BYTES = 8 * 1024 * 1024;
+
+const MIN_RIPGREP_VERSION = { major: 14, minor: 1, patch: 1 };
+const MIN_RIPGREP_VERSION_TEXT = `${MIN_RIPGREP_VERSION.major}.${MIN_RIPGREP_VERSION.minor}.${MIN_RIPGREP_VERSION.patch}`;
+
+const DEFAULT_SCAN_TREE_EXCLUDE_DIRS = [
+  ".git",
+  "node_modules",
+  ".venv",
+  "venv",
+  "__pycache__",
+  ".pytest_cache",
+  ".mypy_cache",
+  ".ruff_cache",
+  "target",
+  ".cache",
+];
+
+type Semver = { major: number; minor: number; patch: number };
+
+function formatSemver(v: Semver): string {
+  return `${v.major}.${v.minor}.${v.patch}`;
+}
+
+function compareSemver(a: Semver, b: Semver): number {
+  if (a.major !== b.major) return a.major < b.major ? -1 : 1;
+  if (a.minor !== b.minor) return a.minor < b.minor ? -1 : 1;
+  if (a.patch !== b.patch) return a.patch < b.patch ? -1 : 1;
+  return 0;
+}
+
+function parseRipgrepVersion(text: string): Semver | null {
+  const m = /ripgrep\s+(\d+)\.(\d+)\.(\d+)/i.exec(text);
+  if (!m) return null;
+  return {
+    major: Number(m[1]),
+    minor: Number(m[2]),
+    patch: Number(m[3]),
+  };
+}
+
+async function readRipgrepVersion(rgPath: string, cwd: string): Promise<Semver> {
+  const MAX_STDOUT_BYTES = 8 * 1024;
+  const MAX_STDERR_BYTES = 8 * 1024;
+  const timeoutMs = 2_000;
+
+  return await new Promise((resolve, reject) => {
+    const useProcessGroup = process.platform !== "win32";
+    const child = spawn(rgPath, ["--version"], {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: useProcessGroup,
+    });
+
+    const killChild = (signal: NodeJS.Signals) => {
+      try {
+        if (useProcessGroup && typeof child.pid === "number") {
+          process.kill(-child.pid, signal);
+        } else {
+          child.kill(signal);
+        }
+      } catch {
+        // ignore
+      }
+    };
+
+    let done = false;
+    let stdout = "";
+    let stderr = "";
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let timedOut = false;
+    let timer: NodeJS.Timeout | null = null;
+
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+    };
+
+    const settleReject = (err: Error) => {
+      if (done) return;
+      done = true;
+      cleanup();
+      reject(err);
+    };
+
+    const settleResolve = (v: Semver) => {
+      if (done) return;
+      done = true;
+      cleanup();
+      resolve(v);
+    };
+
+    timer = setTimeout(() => {
+      timedOut = true;
+      killChild("SIGKILL");
+      // Ensure we settle even if the child never closes (e.g. uninterruptible I/O).
+      try {
+        child.stdout?.destroy();
+      } catch {
+        // ignore
+      }
+      try {
+        child.stderr?.destroy();
+      } catch {
+        // ignore
+      }
+      try {
+        child.unref();
+      } catch {
+        // ignore
+      }
+       const safeRgPath = sanitizeForSingleLineError(rgPath);
+       settleReject(
+         new TypeError(`ripgrep --version timed out after ${timeoutMs}ms (rgPath: ${safeRgPath})`),
+       );
+     }, timeoutMs);
+
+    child.on("error", (e) => {
+      const code = (e as NodeJS.ErrnoException | null)?.code;
+      if (code === "ENOENT") {
+        const safeRgPath = sanitizeForSingleLineError(rgPath);
+        settleReject(new TypeError(`ripgrep executable not found (rgPath: ${safeRgPath})`));
+        return;
+      }
+      settleReject(e instanceof Error ? e : new TypeError(String(e)));
+    });
+
+    child.stdout?.on("error", (e) => {
+      settleReject(e instanceof Error ? e : new TypeError(String(e)));
+    });
+
+    child.stderr?.on("error", (e) => {
+      settleReject(e instanceof Error ? e : new TypeError(String(e)));
+    });
+
+    child.stdout?.on("data", (chunk: Buffer) => {
+      if (stdoutBytes >= MAX_STDOUT_BYTES) return;
+      const remaining = MAX_STDOUT_BYTES - stdoutBytes;
+      const slice = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
+      stdout += slice.toString("utf8");
+      stdoutBytes += slice.length;
+    });
+
+    child.stderr?.on("data", (chunk: Buffer) => {
+      if (stderrBytes >= MAX_STDERR_BYTES) return;
+      const remaining = MAX_STDERR_BYTES - stderrBytes;
+      const slice = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
+      stderr += slice.toString("utf8");
+      stderrBytes += slice.length;
+    });
+
+    child.on("close", (exitCode) => {
+      if (done) return;
+      cleanup();
+      if (timedOut) {
+        const safeRgPath = sanitizeForSingleLineError(rgPath);
+        settleReject(
+          new TypeError(`ripgrep --version timed out after ${timeoutMs}ms (rgPath: ${safeRgPath})`),
+        );
+        return;
+      }
+      if (exitCode !== 0) {
+        const firstLineRaw = `${stderr}\n${stdout}`.trim().split(/\r?\n/)[0];
+        const firstLine = sanitizeForSingleLineError(firstLineRaw);
+        const safeRgPath = sanitizeForSingleLineError(rgPath);
+        settleReject(
+          new TypeError(
+            firstLine
+              ? `ripgrep --version failed: ${firstLine} (rgPath: ${safeRgPath})`
+              : `ripgrep --version failed (exit code ${exitCode}; rgPath: ${safeRgPath})`,
+          ),
+        );
+        return;
+      }
+
+      const v = parseRipgrepVersion(stdout) ?? parseRipgrepVersion(stderr);
+      if (!v) {
+        const firstLineRaw = `${stdout}\n${stderr}`.trim().split(/\r?\n/)[0];
+        const firstLine = sanitizeForSingleLineError(firstLineRaw);
+        const safeRgPath = sanitizeForSingleLineError(rgPath);
+        settleReject(
+          new TypeError(
+            firstLine
+              ? `failed to parse ripgrep version: ${firstLine} (rgPath: ${safeRgPath})`
+              : `failed to parse ripgrep version (rgPath: ${safeRgPath})`,
+          ),
+        );
+        return;
+      }
+
+      settleResolve(v);
+    });
+  });
+}
+
+const ripgrepVersionCheckCache = new Map<string, Promise<void>>();
+
+async function ensureRipgrepVersion(rgPath: string, cwd: string): Promise<void> {
+  let cached = ripgrepVersionCheckCache.get(rgPath);
+  if (!cached) {
+    cached = (async () => {
+      const v = await readRipgrepVersion(rgPath, cwd);
+      if (compareSemver(v, MIN_RIPGREP_VERSION) < 0) {
+        const safeRgPath = sanitizeForSingleLineError(rgPath);
+        throw new TypeError(
+          `ripgrep >= ${MIN_RIPGREP_VERSION_TEXT} is required (found ${formatSemver(v)}; rgPath: ${safeRgPath})`,
+        );
+      }
+    })();
+    ripgrepVersionCheckCache.set(rgPath, cached);
+  }
+
+  await cached;
+}
 
 function toolLink(name: string): string {
   return `reify:tool/${fsKitImport}#${name}`;
@@ -63,6 +289,41 @@ async function scanUtf8TextFile(
   } finally {
     await fh.close();
   }
+}
+
+async function scanUtf8TextRange(
+  fh: FileHandle,
+  startByte: number,
+  endByteExclusive: number,
+  onText: (segment: string) => void,
+): Promise<void> {
+  if (!Number.isInteger(startByte) || startByte < 0) {
+    throw new TypeError("startByte must be an integer >= 0");
+  }
+  if (!Number.isInteger(endByteExclusive) || endByteExclusive < 0) {
+    throw new TypeError("endByteExclusive must be an integer >= 0");
+  }
+  if (endByteExclusive < startByte) {
+    throw new TypeError("endByteExclusive must be >= startByte");
+  }
+  if (endByteExclusive === startByte) return;
+
+  const decoder = new TextDecoder("utf-8");
+  const buf = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+  let pos = startByte;
+
+  while (pos < endByteExclusive) {
+    const toRead = Math.min(buf.length, endByteExclusive - pos);
+    const { bytesRead } = await fh.read(buf, 0, toRead, pos);
+    if (bytesRead === 0) break;
+
+    const chunk = decoder.decode(buf.subarray(0, bytesRead), { stream: true });
+    if (chunk.length > 0) onText(chunk);
+    pos += bytesRead;
+  }
+
+  const tail = decoder.decode();
+  if (tail.length > 0) onText(tail);
 }
 
 export type DirListing = {
@@ -219,7 +480,9 @@ export const readTextWindow = defineTool({
   summary: "Read a line window from a UTF-8 text file",
   input: schema({
     path: schema("string").describe("File path to read"),
-    startLine: schema("number").describe("1-based starting line").default(1),
+    startLine: schema("number")
+      .describe("Starting line: 1-based from start; negative from end (-1 is last line)")
+      .default(1),
     maxLines: schema("number").describe("Maximum number of lines (1-1000)").default(200),
     maxLineChars: schema("number")
       .describe("Maximum characters per line before truncation (1-8192)")
@@ -235,14 +498,16 @@ export const readTextWindow = defineTool({
   doc: [
     "Read a contiguous line window from a UTF-8 file.",
     "",
-    "- Line indexing is 1-based.",
+    "- Line indexing: 1-based from start; negative from end (-1 is last line).",
+    "- `startLine` must be a non-zero integer (>= 1 or <= -1).",
+    "  - If `startLine` is negative and its magnitude exceeds the file's line count, it clamps to the first line.",
     "- Defaults: `startLine = 1` and `maxLines = 200`.",
     "- `maxLines` must be an integer between 1 and 1000.",
     `- Long lines are truncated by default to \`maxLineChars = ${DEFAULT_MAX_LINE_CHARS}\` characters (excluding the line ending).`,
     "  - Character counting uses JS string offsets (UTF-16 code units). To avoid splitting surrogate pairs, the shown prefix may be shorter than maxLineChars.",
     `  - When truncated, the returned \`text\` contains an inline marker: \`${TRUNCATION_MARKER}\`.`,
     "  - Details + continuation hints are returned in the `truncation` field.",
-    "- Line endings are preserved exactly (`\\n` and `\\r\\n`).",
+    "- Line endings are preserved exactly (`\\n`, `\\r`, and `\\r\\n`).",
     "- If `startLine` is past EOF, returns `text: \"\"`, `endLine: null`, `nextStartLine: null`.",
     "- `nextStartLine: null` means there are no more lines to read.",
     "",
@@ -252,8 +517,8 @@ export const readTextWindow = defineTool({
     "```",
   ].join("\n"),
   fn: async ({ path, startLine, maxLines, maxLineChars }) => {
-    if (!Number.isInteger(startLine) || startLine < 1) {
-      throw new TypeError("startLine must be an integer >= 1");
+    if (!Number.isInteger(startLine) || startLine === 0) {
+      throw new TypeError("startLine must be an integer >= 1 or <= -1");
     }
 
     if (!Number.isInteger(maxLines) || maxLines < 1) {
@@ -270,6 +535,98 @@ export const readTextWindow = defineTool({
 
     if (maxLineChars > MAX_MAX_LINE_CHARS) {
       throw new TypeError(`maxLineChars must be <= ${MAX_MAX_LINE_CHARS}`);
+    }
+
+    if (startLine < 0) {
+      const kRequested = -startLine;
+
+      const fh = await open(path, "r");
+      try {
+        const keep = Math.min(maxLines, kRequested);
+        const { ranges: tailRanges, available } = await collectTailLineRanges(fh, kRequested, { keep });
+
+        if (available === 0) {
+          return {
+            text: "",
+            startLine,
+            endLine: null,
+            nextStartLine: null,
+            truncation: null,
+          };
+        }
+
+        const resolvedStartLine = available < kRequested ? -available : startLine;
+        // tailRanges are returned from EOF backward; reverse for output order.
+        const windowRanges = tailRanges.slice().reverse();
+
+        const truncations: Array<{
+          line: number;
+          shownChars: number;
+          omittedChars: number;
+          nextStartChar: number;
+          hint: { toolRef: string; input: { path: string; line: number; startChar: number; maxChars: number } };
+        }> = [];
+
+        const rendered: string[] = [];
+
+        for (let i = 0; i < windowRanges.length; i += 1) {
+          const range: TailLineRange = windowRanges[i];
+          const lineNo = resolvedStartLine + i;
+
+          let contentLen = 0;
+          let prefix = "";
+          await scanUtf8TextRange(fh, range.startByte, range.endByte, (segment) => {
+            contentLen += segment.length;
+            if (prefix.length < maxLineChars) {
+              const remaining = maxLineChars - prefix.length;
+              prefix += segment.slice(0, remaining);
+            }
+          });
+
+          if (contentLen <= maxLineChars) {
+            rendered.push(`${prefix}${range.eol}`);
+          } else {
+            const shown = safeTruncateUtf16(prefix, maxLineChars, { treatAsTruncated: true });
+            rendered.push(`${shown}${TRUNCATION_MARKER}${range.eol}`);
+            const shownChars = shown.length;
+            truncations.push({
+              line: lineNo,
+              shownChars,
+              omittedChars: contentLen - shownChars,
+              nextStartChar: shownChars,
+              hint: {
+                toolRef: toolLink("readTextLineWindow"),
+                input: {
+                  path,
+                  line: lineNo,
+                  startChar: shownChars,
+                  maxChars: Math.max(2, maxLineChars),
+                },
+              },
+            });
+          }
+        }
+
+        const endLine = resolvedStartLine + windowRanges.length - 1;
+        const nextStartLine = endLine === -1 ? null : endLine + 1;
+
+        return {
+          text: rendered.join(""),
+          startLine: resolvedStartLine,
+          endLine,
+          nextStartLine,
+          truncation:
+            truncations.length === 0
+              ? null
+              : {
+                  maxLineChars,
+                  marker: TRUNCATION_MARKER,
+                  lines: truncations,
+                },
+        };
+      } finally {
+        await fh.close();
+      }
     }
 
     const windowEndLine = startLine + maxLines - 1;
@@ -412,7 +769,8 @@ export const readTextLineWindow = defineTool({
   hidden: true,
   input: schema({
     path: schema("string").describe("File path to read"),
-    line: schema("number").describe("1-based line number to page within"),
+    line: schema("number")
+      .describe("Line number: 1-based from start; negative from end (-1 is last line)"),
     startChar: schema("number")
       .describe("0-based starting character offset within the line")
       .default(0),
@@ -435,7 +793,8 @@ export const readTextLineWindow = defineTool({
     "This is a supported-but-unlisted helper used for progressive disclosure when `readTextWindow` truncates long lines.",
     "",
     "Notes:",
-    "- Line indexing is 1-based.",
+    "- Line indexing: 1-based from start; negative from end (-1 is last line).",
+    "  - If `line` is negative and its magnitude exceeds the file's line count, returns `found: false`.",
     "- `startChar` and `maxChars` operate on JS string character offsets (UTF-16 code units).",
     "- The returned `text` never includes the line ending; the original ending is returned as `eol`.",
     "- `nextStartChar: null` means there are no more characters in the line.",
@@ -446,8 +805,8 @@ export const readTextLineWindow = defineTool({
     "```",
   ].join("\n"),
   fn: async ({ path, line, startChar, maxChars }) => {
-    if (!Number.isInteger(line) || line < 1) {
-      throw new TypeError("line must be an integer >= 1");
+    if (!Number.isInteger(line) || line === 0) {
+      throw new TypeError("line must be an integer >= 1 or <= -1");
     }
 
     if (!Number.isInteger(startChar) || startChar < 0) {
@@ -460,6 +819,118 @@ export const readTextLineWindow = defineTool({
 
     if (maxChars > MAX_MAX_LINE_CHARS) {
       throw new TypeError(`maxChars must be <= ${MAX_MAX_LINE_CHARS}`);
+    }
+
+    if (line < 0) {
+      const k = -line;
+      const fh = await open(path, "r");
+      try {
+        const { ranges, available } = await collectTailLineRanges(fh, k, { keep: 1 });
+        if (available < k) {
+          return {
+            found: false,
+            line,
+            startChar,
+            endChar: null,
+            nextStartChar: null,
+            text: "",
+            eol: "",
+          };
+        }
+
+        const target = ranges[0];
+        const targetEndCandidate = startChar + maxChars;
+
+        let currentPos = 0;
+        let prevCodeUnitInLine: number | null = null;
+
+        let outText = "";
+        let pendingEndSurrogateCheck = false;
+        let startBoundaryChecked = startChar === 0;
+
+        await scanUtf8TextRange(fh, target.startByte, target.endByte, (segment) => {
+          // If we ended exactly at the candidate boundary on the prior segment,
+          // the next code unit is the first of this segment.
+          if (pendingEndSurrogateCheck && segment.length > 0) {
+            const nextCu = segment.charCodeAt(0);
+            if (isLowSurrogate(nextCu)) {
+              outText = outText.slice(0, -1);
+              if (outText.length === 0) {
+                throw new TypeError(
+                  "maxChars is too small to return a slice without splitting a surrogate pair",
+                );
+              }
+            }
+            pendingEndSurrogateCheck = false;
+          }
+
+          // Validate the start boundary when we first reach it.
+          if (!startBoundaryChecked && startChar > 0) {
+            const rel = startChar - currentPos;
+            if (rel >= 0 && rel < segment.length) {
+              const cur = segment.charCodeAt(rel);
+              const prev = rel === 0 ? prevCodeUnitInLine : segment.charCodeAt(rel - 1);
+              if (prev !== null && isHighSurrogate(prev) && isLowSurrogate(cur)) {
+                throw new TypeError("startChar must not point into the middle of a surrogate pair");
+              }
+              startBoundaryChecked = true;
+            }
+          }
+
+          const segStart = currentPos;
+          const segEnd = currentPos + segment.length;
+
+          const collectStart = Math.max(segStart, startChar);
+          const collectEnd = Math.min(segEnd, targetEndCandidate);
+          if (collectStart < collectEnd) {
+            outText += segment.slice(collectStart - segStart, collectEnd - segStart);
+          }
+
+          // If we reached the candidate end within this segment, ensure we didn't split a surrogate pair.
+          if (segStart < targetEndCandidate && segEnd >= targetEndCandidate) {
+            const lastCu = outText.length > 0 ? outText.charCodeAt(outText.length - 1) : null;
+            const endsHigh = lastCu !== null && isHighSurrogate(lastCu);
+
+            if (segEnd > targetEndCandidate) {
+              const nextCu = segment.charCodeAt(targetEndCandidate - segStart);
+              if (endsHigh && isLowSurrogate(nextCu)) {
+                outText = outText.slice(0, -1);
+                if (outText.length === 0) {
+                  throw new TypeError(
+                    "maxChars is too small to return a slice without splitting a surrogate pair",
+                  );
+                }
+              }
+              pendingEndSurrogateCheck = false;
+            } else {
+              pendingEndSurrogateCheck = endsHigh;
+            }
+          }
+
+          currentPos = segEnd;
+          if (segment.length > 0) {
+            prevCodeUnitInLine = segment.charCodeAt(segment.length - 1);
+          }
+        });
+
+        const contentLen = currentPos;
+        if (startChar > contentLen) {
+          throw new TypeError("startChar must be <= line length");
+        }
+
+        const end = startChar + outText.length;
+        return {
+          found: true,
+          line,
+          startChar,
+          endChar: end,
+          nextStartChar: end < contentLen ? end : null,
+          text: outText,
+          eol: target.eol,
+        };
+      } finally {
+        await fh.close();
+      }
     }
 
     // Stream the file until we reach the target line, then page within it.
@@ -687,8 +1158,8 @@ export const scanTree = defineTool({
       .describe(`Per-directory entry budget (integer 0+; hard cap: ${MAX_SCAN_TREE_ENTRIES_PER_DIR})`)
       .default(50),
     excludeDirs: schema("string[]")
-      .describe("Directory basenames to exclude")
-      .default(() => [".git", "node_modules"]),
+      .describe("Directory basenames to exclude (defaults skip common deps/env/cache dirs)")
+      .default(() => [...DEFAULT_SCAN_TREE_EXCLUDE_DIRS]),
   }),
   output: ScanTreeOutputSchema,
   doc: [
@@ -710,6 +1181,8 @@ export const scanTree = defineTool({
     "- `more: N` means `N` eligible direct children were omitted (per-dir/global clipping).",
     "- Symlinks are skipped.",
     "- `excludeDirs` directories are omitted and not counted in `more`.",
+    "  - Defaults: `.git`, `node_modules`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `target`, `.cache`.",
+    "  - Override by passing `excludeDirs` explicitly (for example `excludeDirs: []` to include everything).",
     "",
     "Budget notes:",
     "- Budgets bound output size; scanning very large directories can still be expensive.",
@@ -745,7 +1218,7 @@ export const scanTree = defineTool({
     if (perDir > MAX_SCAN_TREE_ENTRIES_PER_DIR) {
       throw new TypeError(`maxEntriesPerDir must be <= ${MAX_SCAN_TREE_ENTRIES_PER_DIR}`);
     }
-    const exclude = new Set(excludeDirs ?? [".git", "node_modules"]);
+    const exclude = new Set(excludeDirs ?? DEFAULT_SCAN_TREE_EXCLUDE_DIRS);
 
     const root = await realpath(path);
     const st = await stat(root);
@@ -850,6 +1323,608 @@ export const scanTree = defineTool({
   },
 });
 
+type SearchTextInput = {
+  /** Root directory to search. */
+  path: string;
+
+  /** Ripgrep pattern (regex by default). */
+  pattern: string;
+
+  /** Treat pattern as a literal string. */
+  fixedStrings?: boolean;
+
+  /** If set, forces case sensitivity. When unset, smartCase controls behavior. */
+  caseSensitive?: boolean;
+
+  /** Enable smart-case matching (default true). */
+  smartCase?: boolean;
+
+  /** Include dotfiles and dot-directories (default true). */
+  hidden?: boolean;
+
+  /** Respect ignore files (.gitignore, .ignore, etc). Default true. */
+  respectIgnore?: boolean;
+
+  /**
+   * Ignore behavior policy when respectIgnore is true.
+   *
+   * - "scoped" (default): deterministic, root-scoped ignore discovery.
+   * - "rg": ripgrep defaults (may consult global ignore, parent ignore files, etc).
+   */
+  ignorePolicy?: "scoped" | "rg";
+
+  /** Directory basenames to exclude anywhere in the tree. */
+  excludeDirs?: string[];
+
+  /** Global matching-line cap. */
+  maxMatches?: number;
+
+  /** Maximum number of files (with matches) to return. */
+  maxFilesWithMatches?: number;
+
+  /** Maximum matching lines to return per file. */
+  maxMatchesPerFile?: number;
+
+  /** Maximum characters to include in the preview line (excluding EOL). */
+  maxPreviewChars?: number;
+
+  /** Lines before a match to include in the readTextWindow hint. */
+  contextLinesBefore?: number;
+
+  /** Lines after a match to include in the readTextWindow hint. */
+  contextLinesAfter?: number;
+
+  /** Kill rg if it runs too long (default 15000ms). */
+  timeoutMs: number;
+
+  /** Maximum bytes allowed for any single rg --json record line. */
+  maxRgJsonLineBytes: number;
+};
+
+type SearchTextSubmatch = {
+  startByte: number;
+  endByte: number;
+};
+
+type SearchTextMatch = {
+  line: number;
+  preview: string;
+  submatches: SearchTextSubmatch[];
+  hint: { toolRef: string; input: { path: string; startLine: number; maxLines: number } };
+};
+
+type SearchTextFile = {
+  path: string;
+  displayPath: string;
+  matches: SearchTextMatch[];
+  more: boolean;
+};
+
+type SearchTextStats = {
+  searches: number;
+  searchesWithMatch: number;
+  matchedLines: number;
+  matches: number;
+  bytesSearched: number;
+  elapsedMs: number;
+};
+
+type SearchTextOutput = {
+  root: string;
+  pattern: string;
+  truncated: boolean;
+  files: SearchTextFile[];
+  stats?: SearchTextStats;
+  errors: string[];
+};
+
+const SearchTextHintSchema = schema({
+  toolRef: "string",
+  input: schema({
+    path: "string",
+    startLine: "number",
+    maxLines: "number",
+  }),
+});
+
+const SearchTextSubmatchSchema = schema({
+  startByte: "number",
+  endByte: "number",
+});
+
+const SearchTextMatchSchema = schema({
+  line: "number",
+  preview: "string",
+  submatches: SearchTextSubmatchSchema.array(),
+  hint: SearchTextHintSchema,
+});
+
+const SearchTextFileSchema = schema({
+  path: "string",
+  displayPath: "string",
+  matches: SearchTextMatchSchema.array(),
+  more: "boolean",
+});
+
+const SearchTextStatsSchema = schema({
+  searches: "number",
+  searchesWithMatch: "number",
+  matchedLines: "number",
+  matches: "number",
+  bytesSearched: "number",
+  elapsedMs: "number",
+});
+
+const SearchTextOutputSchema = schema({
+  root: "string",
+  pattern: "string",
+  truncated: "boolean",
+  files: SearchTextFileSchema.array(),
+  "stats?": SearchTextStatsSchema,
+  errors: "string[]",
+});
+
+function stripSingleLineEnding(text: string): string {
+  if (text.endsWith("\r\n")) return text.slice(0, -2);
+  if (text.endsWith("\n") || text.endsWith("\r")) return text.slice(0, -1);
+  return text;
+}
+
+export const searchText = defineTool({
+  kit: fsKitName,
+  name: "searchText",
+  summary: "Search text under a directory (ripgrep wrapper)",
+  input: schema({
+    path: schema("string").describe("Root directory to search"),
+    pattern: schema("string").describe("Ripgrep pattern (regex by default)"),
+    fixedStrings: schema("boolean").describe("Treat pattern as a literal string").default(false),
+    "caseSensitive?": schema("boolean").describe("Force case sensitivity (overrides smartCase)"),
+    smartCase: schema("boolean").describe("Enable smart-case matching").default(true),
+    hidden: schema("boolean").describe("Include dotfiles and dot-directories").default(true),
+    respectIgnore: schema("boolean").describe("Respect ignore files like .gitignore").default(true),
+    ignorePolicy: schema("'scoped' | 'rg'")
+      .describe("Ignore discovery policy when respectIgnore is true")
+      .default("scoped"),
+    excludeDirs: schema("string[]")
+      .describe("Directory basenames to exclude (defaults skip common deps/env/cache dirs)")
+      .default(() => [...DEFAULT_SCAN_TREE_EXCLUDE_DIRS]),
+    maxMatches: schema("number")
+      .describe(`Global matching-line cap (integer 0+; hard cap: ${MAX_SEARCH_TEXT_MATCHES})`)
+      .default(200),
+    maxFilesWithMatches: schema("number")
+      .describe(
+        `Maximum number of files (with matches) to return (integer 0+; hard cap: ${MAX_SEARCH_TEXT_FILES_WITH_MATCHES})`,
+      )
+      .default(50),
+    maxMatchesPerFile: schema("number")
+      .describe(`Maximum matching lines per file (integer 0+; hard cap: ${MAX_SEARCH_TEXT_MATCHES_PER_FILE})`)
+      .default(20),
+    maxPreviewChars: schema("number")
+      .describe(`Maximum preview characters per match line (integer 0+; hard cap: ${MAX_SEARCH_TEXT_PREVIEW_CHARS})`)
+      .default(200),
+    contextLinesBefore: schema("number")
+      .describe(
+        `Lines before each match to include in the readTextWindow hint (integer 0+; hard cap: ${MAX_SEARCH_TEXT_CONTEXT_LINES})`,
+      )
+      .default(2),
+    contextLinesAfter: schema("number")
+      .describe(
+        `Lines after each match to include in the readTextWindow hint (integer 0+; hard cap: ${MAX_SEARCH_TEXT_CONTEXT_LINES})`,
+      )
+      .default(2),
+    timeoutMs: schema("number")
+      .describe(`Timeout for the rg process (integer > 0; hard cap: ${MAX_SEARCH_TEXT_TIMEOUT_MS})`)
+      .default(15000),
+    maxRgJsonLineBytes: schema("number")
+      .describe(
+        `Maximum bytes allowed for any single rg --json record line (integer > 0; hard cap: ${MAX_SEARCH_TEXT_RG_JSON_LINE_BYTES})`,
+      )
+      .default(DEFAULT_SEARCH_TEXT_RG_JSON_LINE_BYTES),
+  }),
+  output: SearchTextOutputSchema,
+  doc: [
+    "Search for a pattern under a directory using ripgrep (rg) and return bounded, deterministic results.",
+    "",
+    "Output posture:",
+    "- Results are grouped by file and sorted by absolute path.",
+    "- Files include the raw absolute `path` and an escaped `displayPath` for safe printing.",
+    "- Match previews strip the trailing line ending, escape control/bidi characters for safe display, and truncate to maxPreviewChars without splitting escape sequences (surrogate-safe).",
+    `  - When truncated, the preview includes the marker: \`${TRUNCATION_MARKER}\`.`,
+    "- If rg emits an oversized JSON record (for example: a match on a huge/minified line), the search stops early and reports an error.",
+    "- Each match includes a `readTextWindow` hint for bounded context reads.",
+    "",
+    "Defaults:",
+    "- Respects ignore files (.gitignore, .ignore, etc) by default.",
+    "- Uses ignorePolicy: \"scoped\" by default (avoids global/parent ignore sources for determinism).",
+    "- Searches hidden files by default (pass hidden: false to match rg defaults).",
+    `- Excludes common deps/env/cache directories by default (same as \`${toolLink("scanTree")}\` defaults).`,
+    "",
+    "Determinism:",
+    "- Uses `rg --sort=path` and wrapper-side sorting as a backstop.",
+    `- Requires ripgrep (rg) >= ${MIN_RIPGREP_VERSION_TEXT}.`,
+    "- Uses `--no-config` to disable ripgrep config files.",
+  ].join("\n"),
+  fn: async ({
+    path,
+    pattern,
+    fixedStrings,
+    caseSensitive,
+    smartCase,
+    hidden,
+    respectIgnore,
+    ignorePolicy,
+    excludeDirs,
+    maxMatches,
+    maxFilesWithMatches,
+    maxMatchesPerFile,
+    maxPreviewChars,
+    contextLinesBefore,
+    contextLinesAfter,
+    timeoutMs,
+    maxRgJsonLineBytes,
+  }: SearchTextInput): Promise<SearchTextOutput> => {
+    if (typeof pattern !== "string" || pattern.length === 0) {
+      throw new TypeError("pattern must be a non-empty string");
+    }
+
+    const maxMatchesBudget = normalizeIntGE0("maxMatches", maxMatches ?? 200);
+    const maxFilesBudget = normalizeIntGE0("maxFilesWithMatches", maxFilesWithMatches ?? 50);
+    const maxPerFile = normalizeIntGE0("maxMatchesPerFile", maxMatchesPerFile ?? 20);
+    const previewChars = normalizeIntGE0("maxPreviewChars", maxPreviewChars ?? 200);
+    const before = normalizeIntGE0("contextLinesBefore", contextLinesBefore ?? 2);
+    const after = normalizeIntGE0("contextLinesAfter", contextLinesAfter ?? 2);
+
+    if (maxMatchesBudget > MAX_SEARCH_TEXT_MATCHES) {
+      throw new TypeError(`maxMatches must be <= ${MAX_SEARCH_TEXT_MATCHES}`);
+    }
+    if (maxFilesBudget > MAX_SEARCH_TEXT_FILES_WITH_MATCHES) {
+      throw new TypeError(`maxFilesWithMatches must be <= ${MAX_SEARCH_TEXT_FILES_WITH_MATCHES}`);
+    }
+    if (maxPerFile > MAX_SEARCH_TEXT_MATCHES_PER_FILE) {
+      throw new TypeError(`maxMatchesPerFile must be <= ${MAX_SEARCH_TEXT_MATCHES_PER_FILE}`);
+    }
+    if (previewChars > MAX_SEARCH_TEXT_PREVIEW_CHARS) {
+      throw new TypeError(`maxPreviewChars must be <= ${MAX_SEARCH_TEXT_PREVIEW_CHARS}`);
+    }
+    if (before > MAX_SEARCH_TEXT_CONTEXT_LINES) {
+      throw new TypeError(`contextLinesBefore must be <= ${MAX_SEARCH_TEXT_CONTEXT_LINES}`);
+    }
+    if (after > MAX_SEARCH_TEXT_CONTEXT_LINES) {
+      throw new TypeError(`contextLinesAfter must be <= ${MAX_SEARCH_TEXT_CONTEXT_LINES}`);
+    }
+
+    if (!Number.isFinite(timeoutMs) || !Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+      throw new TypeError("timeoutMs must be an integer > 0");
+    }
+    if (timeoutMs > MAX_SEARCH_TEXT_TIMEOUT_MS) {
+      throw new TypeError(`timeoutMs must be <= ${MAX_SEARCH_TEXT_TIMEOUT_MS}`);
+    }
+
+    if (!Number.isFinite(maxRgJsonLineBytes) || !Number.isInteger(maxRgJsonLineBytes) || maxRgJsonLineBytes <= 0) {
+      throw new TypeError("maxRgJsonLineBytes must be an integer > 0");
+    }
+    if (maxRgJsonLineBytes > MAX_SEARCH_TEXT_RG_JSON_LINE_BYTES) {
+      throw new TypeError(`maxRgJsonLineBytes must be <= ${MAX_SEARCH_TEXT_RG_JSON_LINE_BYTES}`);
+    }
+
+    for (const dir of excludeDirs ?? DEFAULT_SCAN_TREE_EXCLUDE_DIRS) {
+      if (typeof dir !== "string" || dir.length === 0) {
+        throw new TypeError("excludeDirs entries must be non-empty strings");
+      }
+      if (dir.includes("/") || dir.includes("\\")) {
+        throw new TypeError("excludeDirs entries must be directory basenames (no separators)");
+      }
+      // We pass excludeDirs through to `--glob` patterns; reject glob metacharacters
+      // so entries behave like literal basenames.
+      if (/[*?\[\]{}!]/.test(dir)) {
+        throw new TypeError("excludeDirs entries must not contain glob metacharacters");
+      }
+    }
+
+    const root = await realpath(path);
+    const st = await stat(root);
+    if (!st.isDirectory()) {
+      throw new TypeError("searchText path must be an existing directory");
+    }
+
+    const rgPath = "rg";
+
+    if (maxMatchesBudget === 0 || maxFilesBudget === 0 || maxPerFile === 0) {
+      return { root, pattern, truncated: false, files: [], errors: [] };
+    }
+
+    await ensureRipgrepVersion(rgPath, root);
+
+    // Deterministic behavior:
+    // - require a modern rg (version-checked)
+    // - use --no-config
+    const baseArgs: string[] = ["--json", "--sort=path", "--no-config"];
+    const restArgs: string[] = [];
+
+    if (fixedStrings === true) restArgs.push("--fixed-strings");
+
+    if (caseSensitive === false) {
+      restArgs.push("--ignore-case");
+    } else if (caseSensitive === undefined && smartCase !== false) {
+      restArgs.push("--smart-case");
+    } else {
+      restArgs.push("--case-sensitive");
+    }
+
+    if (hidden !== false) restArgs.push("--hidden");
+    if (respectIgnore === false) {
+      restArgs.push("--no-ignore");
+    } else if (ignorePolicy !== "rg") {
+      // Default posture: keep ignore behavior root-scoped + deterministic.
+      restArgs.push("--no-ignore-global", "--no-ignore-exclude", "--no-ignore-parent", "--no-require-git");
+    }
+
+    restArgs.push(`--max-count=${maxPerFile}`);
+
+    const exclude = new Set(excludeDirs ?? DEFAULT_SCAN_TREE_EXCLUDE_DIRS);
+    for (const dir of exclude) {
+      restArgs.push(`--glob=!**/${dir}/**`);
+    }
+
+    // Use cwd=root and search "." so ignore-file discovery stays scoped to the target directory.
+    restArgs.push("--", pattern, ".");
+
+    type SearchRun = {
+      errors: string[];
+      filesByPath: Map<string, SearchTextFile>;
+      truncated: boolean;
+      totalMatches: number;
+      sawErrorEvent: boolean;
+      stats: SearchTextStats | undefined;
+      result: RunRipgrepJsonResult;
+    };
+
+    const makePushError = (errors: string[]) => (msg: string) => {
+      if (errors.length >= 20) return;
+      let s = msg.replaceAll("\r\n", "\n").trim();
+      if (s.length === 0) return;
+
+      s = escapeTreeName(s);
+
+      const MAX_ERROR_CHARS = 800;
+      if (s.length > MAX_ERROR_CHARS) {
+        const prefix = safeTruncateUtf16(s, MAX_ERROR_CHARS, { treatAsTruncated: true });
+        s = `${prefix}${TRUNCATION_MARKER}`;
+      }
+
+      errors.push(s);
+    };
+
+    const MAX_SUBMATCHES = 20;
+
+    const runOnce = async (args: string[]): Promise<SearchRun> => {
+      const errors: string[] = [];
+      const pushError = makePushError(errors);
+      const filesByPath = new Map<string, SearchTextFile>();
+      let truncated = false;
+      let totalMatches = 0;
+      let sawErrorEvent = false;
+      let stats: SearchTextStats | undefined;
+
+      const result = await (async () => {
+        try {
+          return await runRipgrepJson({
+            cwd: root,
+            rgPath,
+            args,
+            timeoutMs,
+            maxJsonLineBytes: maxRgJsonLineBytes,
+            onEvent: (event) => {
+              if (truncated) return true;
+
+              if (event.type === "match") {
+                const data = event.data as any;
+                const pathText = data?.path?.text;
+                const line = data?.line_number;
+                const lineText = data?.lines?.text;
+                if (typeof pathText !== "string" || typeof line !== "number" || typeof lineText !== "string") {
+                  return;
+                }
+
+                const absPath = resolve(root, pathText);
+                const relFromRoot = relative(root, absPath);
+                if (
+                  isAbsolute(relFromRoot) ||
+                  relFromRoot === ".." ||
+                  relFromRoot.startsWith("../") ||
+                  (process.platform === "win32" && relFromRoot.startsWith("..\\"))
+                ) {
+                  pushError(`rg produced a path outside the requested root: ${pathText}`);
+                  return;
+                }
+
+                let file = filesByPath.get(absPath);
+                if (!file) {
+                  if (filesByPath.size >= maxFilesBudget) {
+                    truncated = true;
+                    return true;
+                  }
+                  file = { path: absPath, displayPath: escapeTreeName(absPath), matches: [], more: false };
+                  filesByPath.set(absPath, file);
+                }
+
+                if (file.matches.length >= maxPerFile) {
+                  file.more = true;
+                  return;
+                }
+
+                if (totalMatches >= maxMatchesBudget) {
+                  truncated = true;
+                  return true;
+                }
+
+                const stripped = stripSingleLineEnding(lineText);
+                const preview = escapeTreeNamePreview(stripped, previewChars);
+
+                const rawSubmatches = Array.isArray(data?.submatches) ? (data.submatches as any[]) : [];
+                const submatches: SearchTextSubmatch[] = [];
+                for (let i = 0; i < rawSubmatches.length && submatches.length < MAX_SUBMATCHES; i += 1) {
+                  const sm = rawSubmatches[i];
+                  const start = sm?.start;
+                  const end = sm?.end;
+                  if (typeof start === "number" && typeof end === "number") {
+                    submatches.push({ startByte: start, endByte: end });
+                  }
+                }
+
+                const startLine = Math.max(1, line - before);
+                const maxLinesHint = before + 1 + after;
+
+                file.matches.push({
+                  line,
+                  preview,
+                  submatches,
+                  hint: {
+                    toolRef: toolLink("readTextWindow"),
+                    input: { path: absPath, startLine, maxLines: maxLinesHint },
+                  },
+                });
+                totalMatches += 1;
+                if (file.matches.length === maxPerFile) file.more = true;
+
+                if (totalMatches >= maxMatchesBudget) {
+                  truncated = true;
+                  return true;
+                }
+                return;
+              }
+
+              if (event.type === "error") {
+                sawErrorEvent = true;
+                const data = event.data as any;
+                const p = data?.path?.text;
+                const e = data?.error?.text ?? data?.error?.message ?? data?.error;
+                const msg = typeof e === "string" ? e : e ? JSON.stringify(e) : "rg error";
+                pushError(typeof p === "string" ? `${p}: ${msg}` : msg);
+                return;
+              }
+
+              if (event.type === "summary") {
+                const data = event.data as any;
+                const s = data?.stats;
+                const elapsed = data?.elapsed_total ?? s?.elapsed;
+                const secs = typeof elapsed?.secs === "number" ? elapsed.secs : 0;
+                const nanos = typeof elapsed?.nanos === "number" ? elapsed.nanos : 0;
+
+                if (
+                  s &&
+                  typeof s.searches === "number" &&
+                  typeof s.searches_with_match === "number" &&
+                  typeof s.matched_lines === "number" &&
+                  typeof s.matches === "number" &&
+                  typeof s.bytes_searched === "number"
+                ) {
+                  stats = {
+                    searches: s.searches,
+                    searchesWithMatch: s.searches_with_match,
+                    matchedLines: s.matched_lines,
+                    matches: s.matches,
+                    bytesSearched: s.bytes_searched,
+                    elapsedMs: secs * 1000 + nanos / 1e6,
+                  };
+                }
+                return;
+              }
+
+              return;
+            },
+          });
+        } catch (e) {
+          const code = (e as NodeJS.ErrnoException | null)?.code;
+          if (code === "ENOENT") {
+            const safeRgPath = sanitizeForSingleLineError(rgPath);
+            throw new TypeError(`ripgrep executable not found (rgPath: ${safeRgPath})`);
+          }
+          throw e;
+        }
+      })();
+
+      return {
+        errors,
+        filesByPath,
+        truncated,
+        totalMatches,
+        sawErrorEvent,
+        stats,
+        result,
+      };
+    };
+
+    const args: string[] = [...baseArgs, ...restArgs];
+    const run = await runOnce(args);
+
+    let { errors, filesByPath, truncated, totalMatches, sawErrorEvent, stats, result } = run;
+    const pushError = makePushError(errors);
+
+    const stderrTrimmed = result.stderr.trim();
+
+    if (result.outputTooLarge) {
+      truncated = true;
+      pushError(`rg produced an oversized JSON record (maxRgJsonLineBytes: ${maxRgJsonLineBytes})`);
+    }
+    if (result.timedOut) {
+      truncated = true;
+      pushError(`rg timed out after ${timeoutMs}ms`);
+    }
+
+    for (const msg of result.parseErrors) pushError(msg);
+    if (stderrTrimmed.length > 0) {
+      for (const line of stderrTrimmed.split(/\r?\n/)) {
+        pushError(line);
+      }
+    }
+
+    if (
+      !truncated &&
+      typeof result.exitCode === "number" &&
+      result.exitCode > 1 &&
+      totalMatches === 0 &&
+      sawErrorEvent === false
+    ) {
+      // rg uses exit code 2 for both fatal errors (e.g. invalid regex) and
+      // non-fatal file errors; in --json mode the latter usually emit `error`
+      // events. If we didn't see any `error` events and we have no matches,
+      // treat this as a fatal invocation/pattern error.
+      const first = stderrTrimmed.split(/\r?\n/)[0];
+      const safeFirst = sanitizeForSingleLineError(first);
+      throw new TypeError(
+        safeFirst
+          ? `searchText failed: ${safeFirst}`
+          : `searchText failed (rg exit code ${result.exitCode})`,
+      );
+    }
+
+    if (!truncated) {
+      if (typeof result.exitCode === "number" && result.exitCode > 1) {
+        pushError(`rg exited with code ${result.exitCode}`);
+      } else if (result.exitCode === null && result.signal) {
+        pushError(`rg terminated with signal ${result.signal}`);
+      }
+    }
+
+    const files = [...filesByPath.values()]
+      .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+      .map((f) => ({
+        ...f,
+        matches: f.matches.slice().sort((x, y) => x.line - y.line),
+      }));
+
+    return {
+      root,
+      pattern,
+      truncated,
+      files,
+      ...(stats ? { stats } : {}),
+      errors,
+    };
+  },
+});
+
 function isBidiControl(code: number): boolean {
   return (
     code === 0x061c ||
@@ -896,6 +1971,59 @@ function escapeTreeName(name: string): string {
     }
 
     out += ch;
+  }
+
+  return out;
+}
+
+function sanitizeForSingleLineError(raw: string, maxChars = 800): string {
+  let s = raw.replaceAll("\r\n", "\n").trim();
+  if (s.length === 0) return "";
+
+  s = escapeTreeName(s);
+
+  if (s.length > maxChars) {
+    const prefix = safeTruncateUtf16(s, maxChars, { treatAsTruncated: true });
+    return `${prefix}${TRUNCATION_MARKER}`;
+  }
+
+  return s;
+}
+
+function escapeTreeNamePreview(name: string, maxChars: number): string {
+  if (maxChars <= 0) {
+    return name.length === 0 ? "" : TRUNCATION_MARKER;
+  }
+
+  let out = "";
+  let i = 0;
+
+  while (i < name.length) {
+    const codePoint = name.codePointAt(i);
+    if (codePoint === undefined) break;
+    const ch = String.fromCodePoint(codePoint);
+    i += ch.length;
+
+    let token: string;
+    if (ch === "\n") {
+      token = "\\n";
+    } else if (ch === "\r") {
+      token = "\\r";
+    } else if (ch === "\t") {
+      token = "\\t";
+    } else if (codePoint <= 0x1f || codePoint === 0x7f || (codePoint >= 0x80 && codePoint <= 0x9f)) {
+      token = `\\x${codePoint.toString(16).padStart(2, "0")}`;
+    } else if (codePoint === 0x2028 || codePoint === 0x2029 || isBidiControl(codePoint)) {
+      token = `\\u${codePoint.toString(16).padStart(4, "0")}`;
+    } else {
+      token = ch;
+    }
+
+    if (out.length + token.length > maxChars) {
+      return `${out}${TRUNCATION_MARKER}`;
+    }
+
+    out += token;
   }
 
   return out;
@@ -992,6 +2120,7 @@ export const fsKit: Kit = defineKit({
         "",
         "Primary tools:",
         `- \`${toolLink("scanTree")}\``,
+        `- \`${toolLink("searchText")}\``,
         `- \`${toolLink("readTextWindow")}\``,
         "",
         "Supported-but-unlisted helpers:",
@@ -1038,7 +2167,11 @@ export const fsKit: Kit = defineKit({
         "- Removed legacy/unbounded tools: `readText`, `writeText`, `listDir`.",
         "- `readTextWindow` now truncates very long lines by default and returns `truncation` metadata.",
         `  - Use the supported-but-unlisted helper \`${toolLink("readTextLineWindow")}\` to page within a long line.`,
+        `- Added \`searchText\` for bounded, deterministic text search (ripgrep wrapper). Requires \`rg >= ${MIN_RIPGREP_VERSION_TEXT}\`.`,
+        "- `readTextWindow` supports negative `startLine` for tail-style reads (`-1` is the last line).",
+        "- `readTextLineWindow` supports negative `line` with the same convention.",
         "- `scanTree` now enforces hard caps on maxDepth/maxEntries/maxEntriesPerDir to keep results bounded.",
+        "- `scanTree` expanded default `excludeDirs` to skip common deps/env/cache directories (for example `.venv` and `target`).",
         "- Use `readTextWindow` for bounded reads.",
         "- Use `scanTree` (and supported-but-unlisted `viewTree`) for browsing.",
       ].join("\n"),
@@ -1050,6 +2183,9 @@ export const fsKit: Kit = defineKit({
         "",
         "- Refined the fs kit surface to bounded browse/read tools; removed legacy helpers.",
         "- `readTextWindow` now truncates very long lines by default; added hidden `readTextLineWindow` helper.",
+        `- Added \`searchText\` for bounded, deterministic text search (ripgrep wrapper). Requires \`rg >= ${MIN_RIPGREP_VERSION_TEXT}\`.`,
+        "- `readTextWindow` and `readTextLineWindow` now support negative line indexing for tail-style reads.",
+        "- `scanTree` expanded default excludes to skip common deps/env/cache directories.",
       ].join("\n"),
     },
   },
@@ -1058,6 +2194,7 @@ export const fsKit: Kit = defineKit({
     readTextLineWindow,
     readTextWindow,
     scanTree,
+    searchText,
     viewTree,
   },
 });

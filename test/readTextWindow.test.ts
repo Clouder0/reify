@@ -78,10 +78,10 @@ test("readTextWindow rejects invalid startLine and maxLines", async () => {
     await writeFile(path, "a\n", "utf8");
 
     await expect(readTextWindow({ path, startLine: 0, maxLines: 1 })).rejects.toThrow(
-      "startLine must be an integer >= 1",
+      "startLine must be an integer >= 1 or <= -1",
     );
     await expect(readTextWindow({ path, startLine: 1.5, maxLines: 1 })).rejects.toThrow(
-      "startLine must be an integer >= 1",
+      "startLine must be an integer >= 1 or <= -1",
     );
     await expect(readTextWindow({ path, startLine: 1, maxLines: 0 })).rejects.toThrow(
       "maxLines must be an integer >= 1",
@@ -89,6 +89,118 @@ test("readTextWindow rejects invalid startLine and maxLines", async () => {
     await expect(readTextWindow({ path, startLine: 1, maxLines: 1.5 })).rejects.toThrow(
       "maxLines must be an integer >= 1",
     );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("readTextWindow supports negative startLine (-1 is last line)", async () => {
+  const dir = join(process.cwd(), ".tmp-reify-read-window-negative");
+  await rm(dir, { recursive: true, force: true });
+  try {
+    await mkdir(dir, { recursive: true });
+    const path = join(dir, "sample.txt");
+    await writeFile(path, "a\nb\nc\nd\n", "utf8");
+
+    const out = await readTextWindow({ path, startLine: -2, maxLines: 2 });
+
+    expect(out).toEqual({
+      text: "c\nd\n",
+      startLine: -2,
+      endLine: -1,
+      nextStartLine: null,
+      truncation: null,
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("readTextWindow negative paging uses nextStartLine toward EOF", async () => {
+  const dir = join(process.cwd(), ".tmp-reify-read-window-negative-page");
+  await rm(dir, { recursive: true, force: true });
+  try {
+    await mkdir(dir, { recursive: true });
+    const path = join(dir, "sample.txt");
+    await writeFile(path, "a\nb\nc\nd\n", "utf8");
+
+    const out = await readTextWindow({ path, startLine: -4, maxLines: 2 });
+    expect(out).toEqual({
+      text: "a\nb\n",
+      startLine: -4,
+      endLine: -3,
+      nextStartLine: -2,
+      truncation: null,
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("readTextWindow clamps negative startLine when abs(startLine) exceeds file lines", async () => {
+  const dir = join(process.cwd(), ".tmp-reify-read-window-negative-clamp");
+  await rm(dir, { recursive: true, force: true });
+  try {
+    await mkdir(dir, { recursive: true });
+    const path = join(dir, "sample.txt");
+    await writeFile(path, "a\nb\nc\nd\n", "utf8");
+
+    const out = await readTextWindow({ path, startLine: -99, maxLines: 2 });
+
+    expect(out).toEqual({
+      text: "a\nb\n",
+      startLine: -4,
+      endLine: -3,
+      nextStartLine: -2,
+      truncation: null,
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("readTextWindow negative indexing handles last line without newline", async () => {
+  const dir = join(process.cwd(), ".tmp-reify-read-window-negative-no-eol");
+  await rm(dir, { recursive: true, force: true });
+  try {
+    await mkdir(dir, { recursive: true });
+    const path = join(dir, "sample.txt");
+    await writeFile(path, "a\nb\nc", "utf8");
+
+    const out = await readTextWindow({ path, startLine: -1, maxLines: 1 });
+    expect(out).toEqual({
+      text: "c",
+      startLine: -1,
+      endLine: -1,
+      nextStartLine: null,
+      truncation: null,
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("readTextWindow negative indexing preserves CRLF even across chunk boundaries", async () => {
+  const dir = join(process.cwd(), ".tmp-reify-read-window-negative-crlf-chunk");
+  await rm(dir, { recursive: true, force: true });
+  try {
+    await mkdir(dir, { recursive: true });
+    const path = join(dir, "sample.txt");
+
+    // Construct a file where a CRLF occurs exactly at a 64KiB boundary in the
+    // tail-scanner's backward reads. The last line length is (64KiB - 1).
+    const big = "b".repeat(64 * 1024 - 1);
+    await writeFile(path, `a\r\n${big}\n`, "utf8");
+
+    const out = await readTextWindow({ path, startLine: -2, maxLines: 2, maxLineChars: 3 });
+
+    expect(out.text).toBe(`a\r\nbbb<<<REIFY_LINE_TRUNCATED>>>\n`);
+    expect(out.startLine).toBe(-2);
+    expect(out.endLine).toBe(-1);
+    expect(out.nextStartLine).toBeNull();
+    expect(out.truncation).not.toBeNull();
+    expect(out.truncation!.lines[0].line).toBe(-1);
+    expect(out.truncation!.lines[0].hint.input.line).toBe(-1);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

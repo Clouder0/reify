@@ -19,6 +19,14 @@ test("scanTree returns a deterministic nodes map (sorted, dir-first)", async () 
     await mkdir(join(dir, "node_modules"), { recursive: true });
     await writeFile(join(dir, "node_modules", "x.txt"), "x", "utf8");
 
+    // Conservative defaults should also hide common env/build/cache directories.
+    await mkdir(join(dir, ".venv"), { recursive: true });
+    await writeFile(join(dir, ".venv", "pyvenv.cfg"), "x", "utf8");
+    await mkdir(join(dir, "__pycache__"), { recursive: true });
+    await writeFile(join(dir, "__pycache__", "x.pyc"), "x", "utf8");
+    await mkdir(join(dir, "target"), { recursive: true });
+    await writeFile(join(dir, "target", "x"), "x", "utf8");
+
     const out = await scanTree({
       path: dir,
       maxDepth: 2,
@@ -31,6 +39,9 @@ test("scanTree returns a deterministic nodes map (sorted, dir-first)", async () 
     expect(out.nodes["."].files).toEqual(["a.txt", "z.txt"]);
     expect(".git" in (out.nodes as any)).toBe(false);
     expect("node_modules" in (out.nodes as any)).toBe(false);
+    expect(".venv" in (out.nodes as any)).toBe(false);
+    expect("__pycache__" in (out.nodes as any)).toBe(false);
+    expect("target" in (out.nodes as any)).toBe(false);
 
     // Included dirs always have a node entry (even if empty).
     expect(out.nodes["a"]).toBeTruthy();
