@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import fsKit, { fsKitImport } from "../src/kits/fs/index";
+import githubKit, { githubKitImport } from "../src/kits/github/index";
 import { listKits } from "../src/listKits";
 
 type ReifyLink = { kind: "tool" | "doc"; kitImport: string; target: string };
@@ -47,6 +48,23 @@ test("fs docs use fully-qualified links that resolve within the kit", () => {
       expect(link.target in fsKit.tools).toBe(true);
     } else {
       expect(link.target in fsKit.docs).toBe(true);
+    }
+  }
+});
+
+test("github docs use fully-qualified links that resolve within the kit", () => {
+  const pages = Object.values(githubKit.docs);
+  const links = pages.flatMap((p) => extractReifyLinks(p.doc));
+
+  expect(links.length).toBeGreaterThan(0);
+
+  for (const link of links) {
+    expect(link.kitImport).toBe(githubKitImport);
+
+    if (link.kind === "tool") {
+      expect(link.target in githubKit.tools).toBe(true);
+    } else {
+      expect(link.target in githubKit.docs).toBe(true);
     }
   }
 });

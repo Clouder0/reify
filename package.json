@@ -12,6 +12,10 @@
     "./kits/fs": {
       "types": "./dist/kits/fs/index.d.ts",
       "default": "./dist/kits/fs/index.js"
+    },
+    "./kits/github": {
+      "types": "./dist/kits/github/index.d.ts",
+      "default": "./dist/kits/github/index.js"
     }
   },
   "files": [
@@ -23,6 +27,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@octokit/core": "^7.0.6",
     "arktype": "^2.1.29"
   },
   "devDependencies": {
