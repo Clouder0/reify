@@ -196,7 +196,7 @@ src/
 
 - **Runtime:** [Bun](https://bun.sh/) (preferred) or Node.js
 - **TypeScript:** 5.0+
-- **System (for fs kit):** [ripgrep](https://github.com/BurntSushi/ripgrep) >= 14.1.1 (for `searchText`)
+- **System (for fs kit):** [ripgrep](https://github.com/BurntSushi/ripgrep) >= 14.0 (for `searchText`)
 
 ## License
 

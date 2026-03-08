@@ -87,7 +87,7 @@ If you see the tool's schema (kit, name, summary, input/output expressions), the
 
 ## Step 5. Optional — verify ripgrep
 
-The `searchText` tool in the fs kit requires ripgrep >= 14.1.1. All other tools work without it.
+The `searchText` tool in the fs kit requires ripgrep >= 14.0. All other tools work without it.
 
 ```bash
 rg --version

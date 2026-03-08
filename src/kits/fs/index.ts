@@ -35,7 +35,7 @@ const MAX_SEARCH_TEXT_RG_JSON_LINE_BYTES = 8 * 1024 * 1024;
 
 const DEFAULT_EDIT_TEXT_MAX_CHARS = 1024 * 1024; // 1MB max file size
 
-const MIN_RIPGREP_VERSION = { major: 14, minor: 1, patch: 1 };
+const MIN_RIPGREP_VERSION = { major: 14, minor: 0, patch: 0 };
 const MIN_RIPGREP_VERSION_TEXT = `${MIN_RIPGREP_VERSION.major}.${MIN_RIPGREP_VERSION.minor}.${MIN_RIPGREP_VERSION.patch}`;
 
 const DEFAULT_SCAN_TREE_EXCLUDE_DIRS = [
