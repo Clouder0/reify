@@ -1,181 +1,213 @@
-# Reify (Skill / Meta Doc)
+# Reify
 
-Reify is a **code-first, typed toolkit for agents**.
+Reify is a typed toolkit for agents. Tools are normal TypeScript functions — import them and call them like any code.
 
-You do not "invoke tools" through a framework. You **import normal functions** and call them.
-
-Reify v1 is **kit-major**:
-
-- The package root helps you discover built-in kits and inspect tool details.
-- Once you pick a kit, you operate within that kit (docs + dynamic dispatch live on the kit object).
-
-This document is meant to be installed into your agent host as a "skill" so you can reliably
-discover and use Reify without reading source.
-
-In code examples, replace `<REIFY_IMPORT>` with the module specifier you import Reify from
-in your environment (canonical: `@reify-ai/reify`).
-
-## Runtime Convention (Bun-First)
-
-Unless explicitly instructed otherwise, use Bun for all JavaScript/TypeScript execution.
-
-- Preferred runtime and package manager: `bun`
-- Prefer commands: `bun -e`
-- Do not default to: `node`, `npm`, `npx`
-- If Bun is unavailable, state that explicitly, then use Node equivalents as a fallback
-
-## Reify Philosophy (General Agent Behavior)
-
-Reify is not only an API shape; it is an operating style for agent work.
-
-- **Use CodeAct loops for all tasks**, even when you are not calling Reify tools:
-  1. Check current context and available interfaces.
-  2. Choose the smallest useful next action.
-  3. Execute with concrete code/tool calls.
-  4. Observe outputs/errors.
-  5. Iterate or finish with explicit verification.
-- **Prefer action over speculation**: keep reasoning short, then run the next concrete step.
-- **Use progressive disclosure everywhere**: start from compact indexes/summaries, then drill into details only when needed.
-- **Keep contracts explicit**: prefer structured inputs/outputs, typed boundaries, and inspectable metadata over ad-hoc strings.
-- **Evidence before claims**: verify with fresh command/tool output before stating success.
-- **Token efficiency**: tool outputs become part of the LLM context. Use `formatValue()` instead of `JSON.stringify()` to keep results compact.
-
-## What Reify Provides
-
-- Root exports:
-  - `listKits()`
-  - `inspectTool(tool)`
-  - `listTools(kit)` / `listDocs(kit)`
-  - `defineTool(...)` / `defineKit(...)` (authoring)
-- Kit modules (example: `<REIFY_IMPORT>/kits/fs`):
-  - Named exports for tools (primary calling surface)
-  - Default export: the kit object (docs + dynamic dispatch)
-
-## Hard Invariants (Do Not Guess)
-
-- **Tool calling**:
-  - Tools take exactly one input object (validated by ArkType contracts).
-  - Inputs are JSON-like: before validation, top-level keys whose value is exactly `undefined` are treated as omitted (shallow only). (`null` is still validated normally.)
-  - Tools are async (`await` everything).
-  - Output schemas exist for inspection; outputs are not validated by default, but authors can enable per-tool validation with `validateOutput: true` in `defineTool`.
-- **Kit surface**:
-  - `kit.docs` is a map: `kit.docs["index"]`, `kit.docs["recipes/browse-read"]`, ...
-  - `kit.tools` is a map for dynamic dispatch; prefer named imports for normal calling.
-- **Unlisted tools (`meta.hidden`)**:
-  - `listTools(kit)` is a curated index: tools with `tool.meta.hidden === true` are omitted to reduce index bloat.
-  - Unlisted tools are still supported and callable: they remain present in `kit.tools`, and kit docs may link to them via `reify:` tool links.
-- **Link convention** inside Markdown docs:
-  - Tool: `reify:tool/<kitImport>#<toolName>`
-  - Doc: `reify:doc/<kitImport>#<docName>`
-  - To follow a link: import the kit module, then use `kit.tools[...]` / `kit.docs[...]`.
-
-## Agent Workflow (Canonical)
-
-Use the Reify philosophy above as your default loop across the whole task. The steps below are the Reify-specific path once you are working with Reify kits.
-
-0. Verify runtime with `bun --version` (or explicitly declare fallback if Bun is unavailable).
-1. Call `listKits()` to discover built-in kits and their import specifiers.
-2. Import the kit module you want.
-3. Use `listTools(kit)` / `listDocs(kit)` for compact progressive-disclosure indexes (note: `listTools` omits unlisted tools).
-4. Read kit docs via `kit.docs[...]` when you need guidance.
-5. Inspect tool details via `inspectTool(tool)` when you need exact I/O.
-6. Import the tool by name and call it like normal code.
-
-### Running snippets (Bun)
-
-```bash
-bun -e 'import { listKits } from "<REIFY_IMPORT>"; console.log(JSON.stringify(listKits(), null, 2));'
-```
-
-## Examples
-
-### Discover built-in kits
+## Quick Start
 
 ```ts
-import { listKits } from "<REIFY_IMPORT>";
-
-console.log(JSON.stringify(listKits(), null, 2));
+import { listKits } from "@reify-ai/reify";
+console.log(listKits());
 ```
 
-### Read a kit doc page
+Output:
 
-```ts
-import fsKit from "<REIFY_IMPORT>/kits/fs";
-
-console.log(fsKit.docs["index"].doc);
+```
+[
+  { name: "fs",     summary: "Bounded filesystem browsing (scan + search + windowed reads + CAS edits)", import: "@reify-ai/reify/kits/fs" },
+  { name: "github", summary: "Read-only GitHub Threads vision (issues + PRs)",                          import: "@reify-ai/reify/kits/github" }
+]
 ```
 
-### Inspect tool details and then call it
+Pick a kit, import it, call its tools:
 
 ```ts
-import { inspectTool } from "<REIFY_IMPORT>";
-import { readTextWindow } from "<REIFY_IMPORT>/kits/fs";
+import { readTextWindow } from "@reify-ai/reify/kits/fs";
 
-console.log(JSON.stringify(inspectTool(readTextWindow), null, 2));
-const out = await readTextWindow({ path: "README.md", startLine: 1, maxLines: 50 });
-console.log(out.text);
+const page = await readTextWindow({ path: "src/index.ts", startLine: 1, maxLines: 50 });
+console.log(page.text);
 ```
 
-### Optional inputs: `undefined` means “omitted”
+That is a complete tool call. No protocol, no dispatcher — just a function.
 
-Tool inputs are validated like JSON. Passing `undefined` for a top-level key is treated as omitting that key entirely (required keys must still be provided).
+## Philosophy
+
+Reify is not just a set of tools. It is a way of working. These principles apply to everything you do — whether you are calling Reify tools, writing general code, or reasoning about a task.
+
+### Tools are code
+
+In most agent frameworks, tools live behind a protocol. The agent sends a JSON request, a dispatcher routes it, and a result comes back. Each tool call is a round-trip through the LLM.
+
+Reify removes this boundary. Tools are TypeScript functions. This means:
+
+- **You can use any library alongside Reify.** Need to parse JSON, manipulate paths, format dates? Use the standard library or any npm package. You are not locked into a tool catalog.
+- **The same code works for agents and humans.** A function an agent calls is the same function a developer imports in an application, a test, or a script. There is no "agent API" vs "human API."
+- **Tool results are values, not messages.** You can `.filter()`, `.map()`, destructure, or transform results with normal code before they reach your context window.
+
+### Compose freely in one execution
+
+Because tools are code, you can do many things in a single execution. When you are confident about a sequence of steps, batch them:
 
 ```ts
-const cursor: string | undefined = undefined;
-await someTool({ cursor });
-// Equivalent to: await someTool({})
+import { scanTree, searchText, readTextWindow } from "@reify-ai/reify/kits/fs";
+
+// One execution: scan, search, read the first match, extract what you need
+const tree = await scanTree({ path: "src", maxDepth: 2 });
+const hits = await searchText({ path: "src", pattern: "export default", limit: 10 });
+
+const summaries = [];
+for (const hit of hits.matches.slice(0, 3)) {
+  const page = await readTextWindow({ path: hit.path, startLine: Math.max(1, hit.line - 5), maxLines: 20 });
+  summaries.push({ file: hit.path, context: page.text });
+}
+
+console.log(summaries);
 ```
 
-### Format values for LLM consumption (use formatValue, not JSON.stringify)
+This does in one step what would take 5+ round-trips in a protocol-based framework. Intermediate results never touch the context window — only the final output matters.
 
-**CRITICAL**: Tool call results are returned to the LLM as strings and consume context tokens. Always use `formatValue()` for structured output.
-
-**Why this matters**:
-- `JSON.stringify()` produces verbose output (2x indentation spaces, duplicate keys, no truncation)
-- `formatValue()` produces compact, token-efficient output (stable ordering, middle-truncation, configurable cap)
-- You are an LLM agent reading your own output - save tokens for YOUR context window
+The same applies to mixing Reify with general code:
 
 ```ts
-import { formatValue, inspectTool } from "<REIFY_IMPORT>";
-import { readTextWindow } from "<REIFY_IMPORT>/kits/fs";
+import { readTextWindow } from "@reify-ai/reify/kits/fs";
+import { resolve } from "node:path";
 
-// GOOD: Compact, LLM-friendly output
-console.log(formatValue(inspectTool(readTextWindow)));
-
-// BAD: Verbose, wastes tokens (DO NOT DO THIS)
-console.log(JSON.stringify(inspectTool(readTextWindow), null, 2));
+const configPath = resolve("tsconfig.json");
+const page = await readTextWindow({ path: configPath, startLine: 1, maxLines: 100 });
+const config = JSON.parse(page.text);
+console.log("Compiler target:", config.compilerOptions?.target);
 ```
 
-**Use formatValue for**:
-- Inspecting tool schemas with `inspectTool()`
-- Displaying search results, file listings, or any structured data
-- Your own exploration and debugging (console.log output you will read)
+You are writing code. Use the full language.
 
-**Override the cap when needed**:
+### Scale effort to confidence
+
+Composition is powerful, but only when you know what you are doing.
+
+- **High confidence** — batch multiple steps into one execution. You know the files exist, you know the format, you know what to extract. Run it all at once.
+- **Low confidence** — take one small step. Run it. Read the output. Decide the next step based on what you see.
+
+This is not a binary choice. It is a spectrum. A single task might start with cautious one-step exploration, then shift to confident multi-step batches once you understand the structure.
+
+The default when uncertain: **act, then observe.** Run the smallest useful step. Look at the actual output. One executed command teaches more than ten lines of planning.
+
+### Start small, drill deeper
+
+Information should be consumed in layers, not all at once.
+
+In Reify, discovery is layered: `listKits()` → `listTools(kit)` → `inspectTool(tool)` → `kit.docs[...]`. Each layer is small. You only go deeper when the summary is not enough.
+
+This principle applies to all work:
+- Scan a directory before reading individual files.
+- Read a file window before reading the whole file.
+- Search with a broad pattern before narrowing.
+- Skim structure before diving into implementation.
+
+### Verify with evidence
+
+Check results with actual output before claiming success.
+
+- Changed a file? Read it back.
+- Fixed a bug? Run the test.
+- Installed a package? Verify the import works.
+
+Evidence first, conclusions second.
+
+### Respect boundaries
+
+Every Reify tool is bounded — capped entries, windowed reads, limited results. This is intentional. Unbounded output wastes your context window and produces worse results. Work within the bounds: page through results, narrow your search, read specific line ranges.
+
+### Keep outputs compact
+
+Tool results go back into your context window. Use `formatValue()` instead of `JSON.stringify()` to keep them compact. Fewer tokens spent on output means more room for reasoning.
+
 ```ts
-console.log(formatValue(largeValue, { maxChars: 5_000 }));
+import { formatValue } from "@reify-ai/reify";
+console.log(formatValue(result));
 ```
 
-### List tools/docs from a kit
+`formatValue()` uses stable key ordering, minimal whitespace, and middle-truncation (preserving the tail, where errors tend to appear). Default cap is 20,000 characters.
+
+## Workflow
+
+Follow these steps when discovering and using Reify tools.
+
+**Step 1.** Call `listKits()` to see available kits and their import paths.
+
+**Step 2.** Import the kit you need. Each kit has two kinds of exports:
+  - **Named exports** = tool functions you call directly (e.g. `readTextWindow`, `scanTree`)
+  - **Default export** = the kit object, which holds docs and a tools map
+
+**Step 3.** Use `listTools(kit)` to see the kit's tools. Use `listDocs(kit)` to see its doc pages.
 
 ```ts
-import { listDocs, listTools } from "<REIFY_IMPORT>";
-import fsKit from "<REIFY_IMPORT>/kits/fs";
+import { listTools, listDocs } from "@reify-ai/reify";
+import fsKit from "@reify-ai/reify/kits/fs";
 
 console.log(listTools(fsKit));
+// [ { name: "editText", summary: "..." },
+//   { name: "readTextWindow", summary: "..." },
+//   { name: "scanTree", summary: "..." },
+//   { name: "searchText", summary: "..." } ]
+
 console.log(listDocs(fsKit));
+// [ { name: "changelog", summary: "..." },
+//   { name: "concepts/paths", summary: "..." },
+//   { name: "index", summary: "..." },
+//   { name: "recipes/browse-read", summary: "..." }, ... ]
 ```
 
-## Common Failure Modes
+**Step 4.** When you need exact input/output types for a tool, use `inspectTool()`:
 
-- **Runtime drift**: defaulting to `node`/`npm`/`npx` by habit.
-  - Fix by switching to Bun equivalents: `bun --eval`, `bun run`, `bun test`, `bun x`.
-- **Verbose output with JSON.stringify**: using `JSON.stringify(obj, null, 2)` wastes context tokens.
-  - Fix by using `formatValue(obj)` for all structured output you'll read.
-  - Remember: YOU are an LLM - verbose output consumes YOUR context window.
-- **ArkType input validation errors**: your input object doesn't match the tool schema.
-  - Fix by printing `inspectTool(tool).input.expression` and matching that contract exactly.
-- **Missing kit/tool/doc**: you imported the wrong kit module or used the wrong key.
-  - Fix by starting from `listKits()`, then use `listTools(kit)` / `listDocs(kit)`.
-- **Tool not found in `listTools(kit)`**: it may be a supported-but-unlisted helper tool (`tool.meta.hidden === true`).
-  - Fix by following kit docs and/or checking the kit's `tools` table (`kit.tools["..."]`).
+```ts
+import { inspectTool, formatValue } from "@reify-ai/reify";
+import { readTextWindow } from "@reify-ai/reify/kits/fs";
+
+console.log(formatValue(inspectTool(readTextWindow)));
+```
+
+**Step 5.** When you need workflow guidance, read a kit doc page:
+
+```ts
+console.log(fsKit.docs["recipes/browse-read"].doc);
+```
+
+**Step 6.** Import the tool by name and call it.
+
+## Rules
+
+These are hard constraints. Follow them exactly.
+
+1. **Every tool takes one input object.** Pass a single `{ key: value }` object, not positional arguments.
+
+2. **Every tool is async.** Always use `await`.
+
+3. **Optional keys can be omitted or set to `undefined`.** Both are treated the same way. Required keys must always be provided.
+
+4. **`listTools()` shows primary tools only.** Some kits have hidden helper tools (`meta.hidden: true`). These are still callable — find them in kit docs or via `kit.tools["toolName"]`.
+
+5. **Inputs are validated at the boundary.** If you get a validation error, run `inspectTool(tool)` to see the exact schema, then fix your input to match.
+
+## Runtime
+
+Use `bun` for all execution unless instructed otherwise.
+
+```bash
+bun -e 'import { listKits } from "@reify-ai/reify"; console.log(listKits());'
+```
+
+If `bun` is unavailable, use `node` as a fallback and state that explicitly.
+
+## Error Recovery
+
+If a tool call fails:
+
+1. Read the error message — it usually tells you what went wrong.
+2. Run `inspectTool(tool)` to see the exact input schema.
+3. Fix your input to match the schema.
+4. Retry.
+
+If a kit or tool is not found:
+
+1. Run `listKits()` to verify available kits.
+2. Run `listTools(kit)` to verify available tools.
+3. Check `kit.tools["name"]` for hidden helper tools not shown by `listTools`.

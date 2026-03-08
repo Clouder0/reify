@@ -1,78 +1,100 @@
-# Reify Onboarding (Send This To Agents)
+# Reify Onboarding
 
-This document is a **minimal install + verify runbook**.
+This is a one-time setup. After completing these steps, Reify tools and the Reify skill document will be available in your environment permanently.
 
-It intentionally does not assume a specific agent host. Your agent runtime should know how to
-install a skill doc; the Reify meta doc is in `SKILL.md`.
+Reify is a typed toolkit where tools are normal TypeScript functions you import and call. It also provides a philosophy and workflow for how to approach agent work in general.
 
-In commands below, replace:
+There are two things to install:
 
-- `<REIFY_PACKAGE>` with `@reify-ai/reify`.
-- `<REIFY_IMPORT>` with the module specifier you will use in code.
-  - Use the canonical value: `@reify-ai/reify`.
+1. **The npm package** (`@reify-ai/reify`) — provides the tools you call in code.
+2. **The skill document** (`SKILL.md`) — teaches you the philosophy, workflow, and rules. This must be installed into your agent host so it is loaded into your context on every session.
 
-## 1) Install Reify
-
-### Option A: Global install (Bun)
+## Step 1. Install the npm package globally
 
 ```bash
-bun install -g <REIFY_PACKAGE>
+bun install -g @reify-ai/reify
 ```
 
-> Note: Some runtimes cannot import globally-installed packages by name.
-> If imports fail, use the project-local install option below.
+This installs Reify system-wide so you can import it from any project directory. Reify is an agent tool, not a project dependency — it should not go into a project's `package.json`.
 
-### Option B: Project-local install (Bun)
+## Step 2. Verify the package works
 
 ```bash
-bun add <REIFY_PACKAGE>
+bun -e 'import { listKits } from "@reify-ai/reify"; console.log(listKits());'
 ```
 
-## 2) Verify You Can Import + Discover
+You should see output like:
 
-Run one of these quick checks.
+```
+[
+  { name: "fs", summary: "...", import: "@reify-ai/reify/kits/fs" },
+  { name: "github", summary: "...", import: "@reify-ai/reify/kits/github" }
+]
+```
 
-### With Bun
+If you see an import error, the package did not install correctly. Re-run step 1.
+
+If Bun is not available, use Node as a fallback:
 
 ```bash
-bun -e 'import("<REIFY_IMPORT>").then((r) => console.log(JSON.stringify(r.listKits(), null, 2)))'
+node --input-type=module -e 'import { listKits } from "@reify-ai/reify"; console.log(listKits());'
 ```
 
-### With Node
+## Step 3. Install the skill document
+
+The skill document (`SKILL.md`) needs to be copied into your agent host's skill directory so it is loaded into your context automatically.
+
+### Locate SKILL.md
+
+After installing the npm package, `SKILL.md` is inside the installed package directory. Find it:
 
 ```bash
-node --input-type=module -e 'import("<REIFY_IMPORT>").then((r) => console.log(JSON.stringify(r.listKits(), null, 2)))'
+REIFY_SKILL="$(bun -e 'import { createRequire } from "module"; const r = createRequire(import.meta.url); console.log(r.resolve("@reify-ai/reify/SKILL.md"));')"
+echo "$REIFY_SKILL"
 ```
 
-If that works, also verify you can inspect tool details and import a kit module:
+If you fetched this onboarding document from a URL, you can also fetch `SKILL.md` from the same base URL (replace `onboarding.md` with `SKILL.md` in the URL).
+
+### Copy to your agent host
+
+**Claude Code** (project-level):
 
 ```bash
-bun -e 'Promise.all([import("<REIFY_IMPORT>"), import("<REIFY_IMPORT>/kits/fs")]).then(([r, fs]) => console.log(JSON.stringify(r.inspectTool(fs.readTextWindow), null, 2)))'
+mkdir -p .claude/skills
+cp "$REIFY_SKILL" .claude/skills/reify.md
 ```
 
-### Optional: Verify ripgrep (for `fs.searchText`)
+**Claude Code** (user-level, applies to all projects):
 
-`fs.searchText` uses ripgrep (`rg`) and requires `rg >= 14.1.1`.
+```bash
+mkdir -p ~/.claude/skills
+cp "$REIFY_SKILL" ~/.claude/skills/reify.md
+```
+
+**Other agent hosts:**
+
+Copy the contents of `SKILL.md` into your system prompt, skill registry, or knowledge base. The exact mechanism depends on your host.
+
+## Step 4. Verify the skill is installed
+
+Start a new session (or reload your skills) and confirm you can access the Reify workflow. Run:
+
+```bash
+bun -e 'import { inspectTool, formatValue } from "@reify-ai/reify"; import { readTextWindow } from "@reify-ai/reify/kits/fs"; console.log(formatValue(inspectTool(readTextWindow)));'
+```
+
+If you see the tool's schema (kit, name, summary, input/output expressions), the setup is complete.
+
+## Step 5. Optional — verify ripgrep
+
+The `searchText` tool in the fs kit requires ripgrep >= 14.1.1. All other tools work without it.
 
 ```bash
 rg --version
 ```
 
-Expected: `ripgrep 14.1.1` (or newer).
+If ripgrep is missing or too old, `searchText` will fail with a clear error. You can still use `scanTree`, `readTextWindow`, and `editText`.
 
-## 3) Install The Reify Skill Doc
+## Done
 
-Install the contents of `SKILL.md` into your agent host using your host's standard "skill"
-mechanism.
-
-After installing the skill, your canonical workflow is:
-
-0. Use Reify philosophy as your default **CodeAct** mode across the full task (not only Reify tool calls): short reasoning, concrete action, observe output, iterate, verify.
-
-1. `listKits()`
-2. Import the kit module you want
-3. Use `listTools(kit)` / `listDocs(kit)` for compact indexes
-   - Note: `listTools(kit)` omits supported-but-unlisted helper tools (`tool.meta.hidden === true`) to reduce index bloat; kit docs may link to them.
-4. Read docs via `kit.docs[...]` when needed
-5. Use `inspectTool(tool)` to see exact input/output
-6. Import and call the tool
+Reify is installed. The skill document is in your agent host. From now on, start any Reify workflow with `listKits()` and follow the discovery path described in the skill document.
