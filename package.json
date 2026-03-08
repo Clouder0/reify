@@ -1,6 +1,6 @@
 {
   "name": "@reify-ai/reify",
-  "version": "0.0.1",
+  "version": "0.0.3",
   "description": "Code-first, typed toolkit for AI agents",
   "author": "Clouder0",
   "license": "MIT",
