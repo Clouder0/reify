@@ -1,6 +1,22 @@
 {
   "name": "@reify-ai/reify",
-  "version": "0.1.0",
+  "version": "0.0.1",
+  "description": "Code-first, typed toolkit for AI agents",
+  "author": "Clouder0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Clouder0/reify.git"
+  },
+  "keywords": [
+    "agent",
+    "ai",
+    "toolkit",
+    "tools",
+    "llm",
+    "typed",
+    "codeact"
+  ],
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -25,6 +41,7 @@
   ],
   "scripts": {
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
+    "prepublishOnly": "bun run build",
     "test": "bun test",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
